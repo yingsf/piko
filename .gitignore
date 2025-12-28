@@ -1,0 +1,270 @@
+##############################################################################
+# .gitignore（Python + PyCharm/VS Code + Docker/K8s + uv/poetry/pip）
+# 说明：
+# 1) 以“可复用、少误伤”为原则：项目配置类文件默认不忽略；只忽略产物/缓存/本地环境/敏感信息。
+# 2) 如需提交演示证书/公钥/示例环境变量，请使用白名单规则（在末尾用 ! 放行）。
+##############################################################################
+
+############################
+# 1. 操作系统生成的杂项文件
+############################
+
+## 通用临时/备份 ##
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+tmp/
+temp/
+
+## Linux ##
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+## macOS ##
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+*.icloud
+# Finder 图标文件名实际包含回车符，用通配符更安全
+Icon?
+
+## Windows ##
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+############################
+# 2. IDE / 编辑器
+############################
+
+## JetBrains（PyCharm/IDEA 等） ##
+.idea/
+*.iml
+out/
+
+## VS Code ##
+.vscode/
+*.code-workspace
+
+############################
+# 3. Python：字节码/缓存/构建产物
+############################
+
+## 字节码 & 缓存 ##
+__pycache__/
+*.py[cod]
+*$py.class
+
+## C 扩展/编译产物 ##
+*.so
+*.pyd
+*.dll
+*.dylib
+
+## 构建/分发产物（setuptools/wheel 等） ##
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+share/python-wheels/
+pip-wheel-metadata/
+*.egg
+MANIFEST
+
+## PyInstaller ##
+*.spec
+*.manifest
+
+############################
+# 4. Python：测试、覆盖率、质量工具缓存
+############################
+
+## 测试/覆盖率 ##
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+*.py,cover
+nosetests.xml
+
+## Hypothesis ##
+.hypothesis/
+
+## tox / nox ##
+.tox/
+.nox/
+
+## 代码风格/静态检查缓存 ##
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+############################
+# 5. Python：常见框架与文档工具
+############################
+
+## Django ##
+*.log
+db.sqlite3
+db.sqlite3-journal
+
+## Flask ##
+instance/
+.webassets-cache
+
+## Scrapy ##
+.scrapy
+
+## Sphinx ##
+docs/_build/
+
+## PyBuilder ##
+.pybuilder/
+target/
+
+## Jupyter/IPython ##
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+############################
+# 6. 虚拟环境与依赖管理（uv / poetry / pip）
+############################
+
+## 虚拟环境目录（强烈建议忽略） ##
+.venv/
+venv/
+ENV/
+env/
+
+## uv（常见本地缓存/虚拟环境目录，按需保守忽略） ##
+# 说明：uv 的项目虚拟环境通常仍推荐用 .venv/；uv 的全局缓存一般不在仓库内。
+# 这里加上 .uv/ 以防有人把 uv 的本地目录放进仓库。
+.uv/
+
+## Poetry ##
+# 说明：poetry.lock 通常建议提交，以保证依赖一致；因此不忽略。
+# poetry.lock
+
+## pip ##
+pip-log.txt
+pip-delete-this-directory.txt
+
+############################
+# 7. Docker / Kubernetes（本地与生成物）
+############################
+
+## Docker 本地覆盖与临时文件 ##
+# 说明：Dockerfile 与 docker-compose.yml 通常应提交；但本地覆盖文件建议忽略。
+docker-compose.override.yml
+docker-compose.*.override.yml
+
+## K8s 本地渲染/生成输出 ##
+# 说明：k8s YAML 通常应提交；但 helm/kustomize 渲染后的输出建议忽略。
+*.rendered.yaml
+*.rendered.yml
+helmfile.d/
+.chart/
+charts/.tgz
+
+############################
+# 8. 安全与敏感信息（强忽略）
+############################
+
+## 环境变量文件 ##
+.env
+.env.*
+.env.local
+.env.*.local
+
+## 常见密钥/证书/凭据文件（谨慎：如需提交示例证书请用白名单放行） ##
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 常见云/工具凭据（如你的团队不会用可删；但保留更安全）
+**/credentials.json
+**/secret*.json
+**/*secret*
+**/*token*
+**/*passwd*
+**/*password*
+
+############################
+# 9. 运行时产物与日志（通用）
+############################
+
+logs/
+log/
+*.pid
+*.pid.lock
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+############################
+# 10. 其他常见工具目录（保守忽略）
+############################
+
+# mkdocs
+site/
+
+# Spyder / Rope
+.spyderproject
+.spyproject
+.ropeproject
+
+# direnv / asdf（如果你们不用可以删）
+.direnv/
+.envrc
+.tool-versions
+
+######################################################################
+# 白名单示例（需要时启用）
+# 说明：如果确实要提交示例环境变量/证书/密钥，请用如下方式放行：
+#
+# !.env.example
+# !certs/public/*.pem
+# !certs/demo/*.p12
+######################################################################
+
+############################
+# 99. 项目个性化忽略（仅本工程）
+############################
+tmp_git_message.txt
+

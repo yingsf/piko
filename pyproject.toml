@@ -1,0 +1,6 @@
+[project]
+name = "piko"
+version = "0.1.0"
+description = "APScheduler 二次封装框架"
+requires-python = ">=3.12"
+dependencies = []
