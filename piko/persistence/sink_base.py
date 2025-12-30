@@ -10,6 +10,39 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 
+def on(model_type: Type[T]):
+    """模块级装饰器：标记类方法为特定类型的处理函数
+
+    该装饰器用于在 TypedSink 子类中声明式地注册处理逻辑。它主要用于打标记（Tagging），并不直接修改函数行为
+    TypedSink 在实例化（__init__）时会通过反射机制（Reflection）自动扫描带有此标记的方法，并将其注册到内部路由表中
+
+    Args:
+        model_type (Type[T]): 待处理的数据类型（通常为 Pydantic Model 类）
+            当 Sink 接收到该类型的 payload 时，会自动分发给被装饰的方法处理
+
+    Returns:
+        Callable: 装饰器函数，返回原函数对象（保持函数签名不变）
+
+    Example:
+        ```python
+        from piko.persistence.sink_base import TypedSink, on
+
+        class ArchiveSink(TypedSink):
+            @on(User)  # <--- 使用模块级装饰器
+            async def save_users(self, users: List[User]):
+                ...
+        ```
+    """
+
+    def decorator(func: Callable[[List[T]], Awaitable[None]]):
+        # 给函数对象打上私有标记，记录它意图处理的类型
+        # 这种方式不会污染函数签名，且对类继承友好
+        setattr(func, "_piko_handler_for", model_type)
+        return func
+
+    return decorator
+
+
 class ResultSink(ABC):
     """数据持久化 Sink 抽象基类（协议接口）
 
@@ -65,21 +98,22 @@ class TypedSink(ResultSink):
         self._handlers (Dict[Type, Callable]): 类型到处理函数的路由表
 
     Methods:
-        on: 装饰器，注册特定类型的处理函数
+        on: 装饰器，注册特定类型的处理函数（实例方法版，用于动态注册）
         write_batch: 重写的批量写入方法，实现自动分组和分发逻辑
 
     Example:
         ```python
+        # 方式一：声明式注册（推荐）
         class MySink(TypedSink):
             def __init__(self):
                 super().__init__("my_sink")
 
-            @self.on(User)
+            @on(User)  # 使用模块级装饰器
             async def save_users(self, users: List[User]):
                 # 批量写入用户表
                 await db.execute(insert(User).values([u.dict() for u in users]))
 
-            @self.on(Order)
+            @on(Order)
             async def save_orders(self, orders: List[Order]):
                 # 批量写入订单表
                 await db.execute(insert(Order).values([o.dict() for o in orders]))
@@ -97,8 +131,56 @@ class TypedSink(ResultSink):
         # 键为 Python 类型对象（如 User、Order），值为 async 函数
         self._handlers: Dict[Type, Callable[[List[Any]], Awaitable[None]]] = {}
 
+        # [新增] 初始化时执行反射扫描，自动注册带有 @on 标记的方法
+        self._auto_register_handlers()
+
+    def _auto_register_handlers(self):
+        """反射扫描并注册处理函数
+
+        遍历当前实例的所有属性和方法（包括继承自父类的方法），查找带有 `_piko_handler_for`
+        标记的方法，并将其注册到 `self._handlers` 路由表中
+
+        机制说明：
+            1. 使用 `dir(self)` 获取所有属性名
+            2. 使用 `getattr` 获取属性值（此时获取到的是已绑定到实例的 bound method）
+            3. 检查方法对象是否存在 `_piko_handler_for` 属性（由 @on 装饰器注入）
+            4. 如果存在，读取目标类型并注册
+
+        Logging:
+            - Debug: 成功注册处理器时记录
+            - Warning: 如果同一个类型被多个方法注册（覆盖），记录警告
+        """
+        for attr_name in dir(self):
+            try:
+                # 获取属性值（忽略访问受限的属性）
+                method = getattr(self, attr_name)
+            except Exception:
+                continue
+
+            # 检查是否有 @on 装饰器留下的标记
+            if hasattr(method, "_piko_handler_for"):
+                model_type = getattr(method, "_piko_handler_for")
+
+                # 重复注册检测（优先保留最后扫描到的，通常是子类覆盖父类的情况，但仍需警告）
+                if model_type in self._handlers:
+                    existing = self._handlers[model_type].__name__
+                    logger.warning(
+                        f"TypedSink '{self.name}': Duplicate handler detected for type {model_type.__name__}. "
+                        f"Overwriting {existing} with {method.__name__}"
+                    )
+                else:
+                    logger.debug(
+                        f"TypedSink '{self.name}': Auto-registered handler '{method.__name__}' "
+                        f"for type {model_type.__name__}"
+                    )
+
+                # 注册到路由表
+                self._handlers[model_type] = method
+
     def on(self, model_type: Type[T]):
-        """装饰器：注册特定类型的处理函数
+        """装饰器：注册特定类型的处理函数（实例方法版）
+
+        用于在运行时动态注册处理器，或者在不支持模块级装饰器的场景下使用。
 
         Args:
             model_type (Type[T]): 待处理的数据类型（通常为 Pydantic Model）
@@ -179,4 +261,3 @@ class TypedSink(ResultSink):
                     f"TypedSink '{self.name}' received unhandled type: {p_type}. "
                     f"Registered types: {list(self._handlers.keys())}"
                 )
-                
