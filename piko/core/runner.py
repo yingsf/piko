@@ -7,6 +7,7 @@ from contextlib import AsyncExitStack
 from typing import Optional, List, cast, Tuple, Dict, Any
 
 from croniter import croniter
+from sqlalchemy import delete
 from sqlalchemy import insert, update, select, CursorResult
 from sqlalchemy.exc import IntegrityError
 
@@ -464,7 +465,17 @@ class JobRunner:
                 log.error("job_failed", error=error_msg, exc_info=True)
 
             finally:
-                # 无论成功还是失败，都执行以下清理和记录操作
+                # 释放幂等锁
+                try:
+                    stmt = delete(JobLock).where(
+                        JobLock.job_id == job_id,
+                        JobLock.scheduled_time == scheduled_time
+                    )
+                    async for session in get_session():
+                        await session.execute(stmt)
+                        await session.commit()
+                except Exception as e:
+                    log.error("release_lock_failed", error=str(e))
 
                 # 计算执行耗时（毫秒）
                 end_ts = asyncio.get_running_loop().time()
