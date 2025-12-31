@@ -97,21 +97,13 @@ class SchedulerManager:
 
     Example:
         ```python
-        from piko.core.scheduler import scheduler_manager
-
-        # 启动调度器
+        # PikoApp 会自动实例化此类
+        scheduler_manager = SchedulerManager()
         scheduler_manager.startup()
-
-        # 获取原始调度器（供 ConfigWatcher 使用）
-        raw = scheduler_manager.raw_scheduler
-        raw.add_job(func=my_task, trigger='cron', hour=10)
-
-        # 优雅关闭
-        scheduler_manager.shutdown()
         ```
 
     Note:
-        - 本类应作为全局单例使用（见模块底部的 `scheduler_manager = SchedulerManager()`）
+        - 在 Piko 2.0 中，本类由 PikoApp 实例化，不再作为全局单例
         - 调度器启动后会自动创建后台线程（事件循环），无需手动管理
         - 优雅关闭时（`shutdown(wait=True)`）会等待在途任务执行完毕
     """
@@ -157,7 +149,7 @@ class SchedulerManager:
         Note:
             - 启动后调度器会立即开始工作，但由于 JobStore 是空的（MemoryJobStore），
               不会触发任何任务，直到 ConfigWatcher 从数据库同步任务进来
-            - 应在应用启动时调用（如 FastAPI 的 `@app.on_event("startup")`）
+            - 应在应用启动时调用
         """
         # 幂等性检查：如果已启动，直接返回
         if not self._scheduler.running:
@@ -171,7 +163,7 @@ class SchedulerManager:
 
         Note:
             - `wait=True` 确保在途任务有机会执行完（如正在写入数据库的任务）
-            - 应在应用关闭时调用（如 FastAPI 的 `@app.on_event("shutdown")`）
+            - 应在应用关闭时调用
             - 如果在途任务长时间不结束，可能导致关闭阻塞（应设置超时保护）
         """
         # 检查调度器是否正在运行
@@ -189,11 +181,6 @@ class SchedulerManager:
             AsyncIOScheduler: APScheduler 的调度器实例
 
         Note:
-            - 不建议直接使用此属性，应通过 SchedulerManager 的封装方法操作调度器
             - ConfigWatcher 需要直接访问调度器来同步任务，因此暴露此属性
         """
         return self._scheduler
-
-
-# 创建全局的调度器管理器实例
-scheduler_manager = SchedulerManager()

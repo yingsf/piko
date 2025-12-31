@@ -12,14 +12,14 @@ from sqlalchemy import insert, update, select, CursorResult
 from sqlalchemy.exc import IntegrityError
 
 from piko.config import settings
-from piko.core.cache import config_cache
-from piko.core.registry import registry, JobOptions
+from piko.core.cache import ConfigCache
+from piko.core.registry import JobRegistry, JobOptions
 from piko.core.types import DataInterval, BackfillPolicy
 from piko.infra.db import get_session, JobLock, JobRun, ScheduledJob, utcnow
 from piko.infra.leader import get_leader_mutex
 from piko.infra.logging import get_logger
 from piko.infra.observability import JOB_RUN_TOTAL, JOB_DURATION_SECONDS
-from piko.persistence.writer import persistence_writer
+from piko.persistence.writer import PersistenceWriter
 
 logger = get_logger(__name__)
 
@@ -49,35 +49,44 @@ class JobRunner:
 
     Attributes:
         host_id (str): 主机标识符，格式为 "hostname:pid"，用于记录任务的执行节点
+        registry (JobRegistry): 任务注册中心实例
+        config_cache (ConfigCache): 配置缓存实例
+        writer (PersistenceWriter): 持久化写入器实例
 
     Example:
         ```python
-        from piko.core.runner import job_runner
+        # 在 PikoApp 中初始化
+        runner = JobRunner(registry=app.registry, config_cache=app.cache, writer=app.writer)
 
-        # APScheduler 会自动调用此方法
-        await job_runner.run_job("my_task", scheduled_time=datetime(2025, 12, 30, 10, 0, 0))
-
-        # 任务函数的签名（资源自动注入）
-        @job("my_task", resources={"db": PostgresResource, "cache": RedisResource})
-        async def my_task(ctx, scheduled_time, db, cache):
-            # db 和 cache 是自动注入的资源实例
-            data = await db.fetch("SELECT * FROM users")
-            await cache.set("users", data)
+        # 触发任务
+        await runner.run_job("my_task", scheduled_time=datetime(2025, 12, 30, 10, 0, 0))
         ```
 
     Note:
-        - 本类应作为全局单例使用（见模块底部的 `job_runner = JobRunner()`）
         - 任务函数必须是协程函数（async def）
         - 资源的生命周期完全由 AsyncExitStack 管理，任务函数无需手动关闭资源
     """
 
-    def __init__(self):
+    def __init__(
+            self,
+            registry: JobRegistry,
+            config_cache: ConfigCache,
+            writer: PersistenceWriter
+    ):
         """初始化任务执行引擎
 
-        获取主机标识符（hostname:pid），用于记录任务的执行节点
+        Args:
+            registry (JobRegistry): 任务注册中心，用于查找任务处理函数和配置
+            config_cache (ConfigCache): 配置缓存，用于获取任务的运行时配置
+            writer (PersistenceWriter): 持久化写入器，用于写入任务产生的数据
         """
         # 构建主机标识符：hostname:pid
         self.host_id = f"{socket.gethostname()}:{os.getpid()}"
+
+        # 依赖注入
+        self.registry = registry
+        self.config_cache = config_cache
+        self.writer = writer
 
     async def run_job(self, job_id: str, scheduled_time: datetime.datetime | None = None):
         """任务执行的核心入口（支持有状态回填 + 资源注入）
@@ -181,14 +190,14 @@ class JobRunner:
             log.trace("runner_skip_standby")
             return None
 
-        # 白名单检查：任务是否已注册
-        handler = registry.get_job(job_id)
+        # 白名单检查：任务是否已注册，使用注入的 registry 实例
+        handler = self.registry.get_job(job_id)
         if not handler:
             log.warning("runner_skip_unregistered")
             return None
 
         # 获取任务元数据
-        opts = registry.get_options(job_id)
+        opts = self.registry.get_options(job_id)
 
         # 返回验证结果
         return handler, opts
@@ -374,8 +383,8 @@ class JobRunner:
             8. 记录 Prometheus 指标
             9. 释放资源（AsyncExitStack 自动清理）
         """
-        # 从缓存获取配置
-        cached_conf = config_cache.get(job_id)
+        # 从缓存获取配置，使用注入的 config_cache 实例
+        cached_conf = self.config_cache.get(job_id)
         config_version = cached_conf.version if cached_conf else None
 
         # 尝试获取幂等锁
@@ -417,14 +426,15 @@ class JobRunner:
         # 资源管理栈
         async with AsyncExitStack() as stack:
             try:
-                # 获取任务处理函数
-                handler = registry.get_job(job_id)
+                # 获取任务处理函数，使用注入的 registry 实例
+                handler = self.registry.get_job(job_id)
                 if not handler:
                     raise ValueError(f"Job {job_id} handler missing")
 
                 # 如果有配置，使用 Pydantic 验证配置数据
                 if cached_conf:
-                    typed_config = registry.validate_config(job_id, cached_conf.config_json)
+                    # 使用注入的 registry 实例进行校验
+                    typed_config = self.registry.validate_config(job_id, cached_conf.config_json)
                     ctx["config"] = typed_config
 
                 # 遍历资源定义字典，逐个实例化并注入资源
@@ -452,8 +462,8 @@ class JobRunner:
                 # 调用任务处理函数，传入 ctx、scheduled_time 和所有注入的资源
                 await handler(ctx, scheduled_time, **injected_kwargs)
 
-                # 刷新持久化缓冲区
-                await persistence_writer.flush()
+                # 刷新持久化缓冲区，使用注入的 writer 实例
+                await self.writer.flush()
 
                 # 任务执行成功，更新状态
                 status = "SUCCESS"
@@ -654,7 +664,3 @@ class JobRunner:
         async for session in get_session():
             await session.execute(stmt)
             await session.commit()
-
-
-# 创建全局的任务执行引擎实例
-job_runner = JobRunner()
