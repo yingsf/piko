@@ -7,7 +7,7 @@ from typing import Dict
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from piko.config import settings
 from piko.core.cache import ConfigCache, CachedConfig
@@ -24,23 +24,16 @@ class ConfigWatcher:
     """配置监视器与调度器协调器（Reconcile 模式）
 
     本类负责监听数据库中的任务配置变更，并将变更同步到 APScheduler 和内存缓存中
-    采用"协调循环（Reconciliation Loop）"设计模式，定期比对数据库与内存状态，自动处理任务的增删改，确保调度器始终运行最新的配置
-
-    设计模式：
-        - 协调循环：类似于 Kubernetes 的 Controller 模式，定期轮询数据库并计算差异（diff）
-        - 最终一致性：配置变更不会立即生效，而是在下一个轮询周期后同步
-        - 依赖注入：所有外部组件（Scheduler, Cache, Registry, Runner）均通过构造函数注入
+    采用"协调循环（Reconciliation Loop）"设计模式，定期比对数据库与内存状态，自动处理任务的增删改
 
     Attributes:
         _scheduler_manager (SchedulerManager): 调度器管理器实例
         _config_cache (ConfigCache): 配置缓存实例
         _registry (JobRegistry): 任务注册中心实例
-        _runner (JobRunner): 任务执行引擎实例（用于注册回调）
+        _runner (JobRunner): 任务执行引擎实例
         _running (bool): 协调循环是否正在运行
         _task (asyncio.Task | None): 协调循环的异步任务
-
-    Note:
-        - 本类由 PikoApp 实例化，不再作为全局单例
+        _dynamic_interval (float): 动态轮询间隔，可由系统配置覆盖
     """
 
     def __init__(
@@ -56,35 +49,31 @@ class ConfigWatcher:
             scheduler_manager (SchedulerManager): 负责操作 APScheduler
             config_cache (ConfigCache): 负责更新内存配置
             registry (JobRegistry): 负责白名单校验
-            runner (JobRunner): 负责提供任务执行入口（run_job）
+            runner (JobRunner): 负责提供任务执行入口
         """
         self._scheduler_manager = scheduler_manager
         self._config_cache = config_cache
         self._registry = registry
         self._runner = runner
 
-        # 协调循环的运行标志
         self._running = False
         self._task: asyncio.Task | None = None
 
-    async def start(self):
-        """启动配置监视器的协调循环
+        # ✅ [新增] 动态轮询间隔，初始值使用配置文件默认值
+        self._dynamic_interval = settings.poll_interval_s
 
-        创建一个后台异步任务，定期执行协调逻辑（`_watch_loop`）
-        """
+    async def start(self):
+        """启动配置监视器的协调循环"""
         if self._running:
             return
 
         self._running = True
         self._task = asyncio.create_task(self._watch_loop())
         await asyncio.sleep(0)
-        logger.info("config_watcher_started")
+        logger.info("config_watcher_started", interval=self._dynamic_interval)
 
     async def stop(self):
-        """停止配置监视器的协调循环（优雅关闭）
-
-        取消后台协调任务并等待其完全退出
-        """
+        """停止配置监视器的协调循环"""
         self._running = False
         if self._task:
             self._task.cancel()
@@ -100,11 +89,13 @@ class ConfigWatcher:
                 raise
             except Exception as e:
                 logger.error("watcher_reconcile_error", error=str(e))
+                # 异常时退避到默认间隔，防止数据库故障导致死循环风暴
                 await asyncio.sleep(settings.poll_interval_s)
                 continue
 
+            # ✅ [关键] 使用动态更新的间隔时间
             jitter = random.uniform(-settings.poll_jitter_s, settings.poll_jitter_s)
-            sleep_time = max(1, settings.poll_interval_s + jitter)
+            sleep_time = max(1, self._dynamic_interval + jitter)
             await asyncio.sleep(sleep_time)
 
     async def _reconcile(self):
@@ -113,11 +104,11 @@ class ConfigWatcher:
         db_configs: Dict[str, JobConfig] = {}
 
         async for session in get_session():
+            # 1. 读取业务任务
             stmt_job = select(ScheduledJob).where(ScheduledJob.enabled.is_(True))
             result_job = await session.execute(stmt_job)
 
             for row in result_job.scalars():
-                # 使用注入的 registry 实例进行白名单检查
                 if self._registry.get_job(row.job_id):
                     db_jobs[row.job_id] = row
                 else:
@@ -128,11 +119,27 @@ class ConfigWatcher:
             for row in result_cfg.scalars():
                 db_configs[row.job_id] = row
 
+            # 2. ✅ [新增] 读取系统级动态配置
+            try:
+                sys_stmt = text("SELECT config_json FROM job_config WHERE job_id = :sys_id")
+                sys_res = await session.execute(sys_stmt, {"sys_id": "piko_system_settings"})
+                sys_row = sys_res.fetchone()
+
+                if sys_row:
+                    config_data = sys_row[0]
+                    if isinstance(config_data, (str, bytes)):
+                        config_data = json.loads(config_data)
+
+                    new_interval = config_data.get("poll_interval_s")
+                    if new_interval and isinstance(new_interval, (int, float)):
+                        if new_interval != self._dynamic_interval:
+                            logger.info(f"⚙️ [System] 轮询间隔已变更为: {new_interval}秒")
+                            self._dynamic_interval = new_interval
+            except Exception as e:
+                logger.warning("system_config_load_failed", error=str(e))
+
         self._sync_config_cache(db_configs)
-
-        # 使用注入的 config_cache 实例
         self._config_cache.prune(set(db_configs.keys()))
-
         self._sync_scheduler(db_jobs)
 
     def _sync_config_cache(self, db_configs: Dict[str, JobConfig]):
@@ -148,12 +155,10 @@ class ConfigWatcher:
                 version=row.version,
                 schema_version=row.schema_version
             )
-            # 使用注入的 config_cache 实例
             self._config_cache.set(job_id, cached)
 
     def _sync_scheduler(self, db_jobs: Dict[str, ScheduledJob]):
         """同步任务到 APScheduler（增删改）"""
-        # 使用注入的 scheduler_manager 实例
         raw_scheduler = self._scheduler_manager.raw_scheduler
 
         ap_job_ids = {job.id for job in raw_scheduler.get_jobs()}
@@ -187,7 +192,6 @@ class ConfigWatcher:
         if not trigger:
             return
 
-        # 使用注入的 runner 实例的 run_job 方法
         self._scheduler_manager.raw_scheduler.add_job(
             func=self._runner.run_job,
             trigger=trigger,

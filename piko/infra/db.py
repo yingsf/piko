@@ -56,8 +56,8 @@ def init_db() -> None:
         连接池配置考量：
         - pool_size: 常驻连接数，根据并发度调整
         - max_overflow: 突发流量时的额外连接数
-        - pool_recycle: 定期回收连接，防止 MySQL 服务端超时断开
-        - pool_pre_ping: 每次取出连接前先 ping，确保连接有效（容错性 vs 性能权衡）
+        - pool_recycle: 定期回收连接，防止 MySQL 服务端超时断开 (默认 3600s)
+        - pool_pre_ping: 每次取出连接前先 ping，确保连接有效（解决 "Lost connection during query" 的关键）
     """
     global _engine, _session_maker
     if _engine:
@@ -73,8 +73,10 @@ def init_db() -> None:
         settings.mysql_dsn,
         pool_size=settings.mysql_pool_size,
         max_overflow=settings.mysql_max_overflow,
+        # 强制回收旧连接，防止防火墙切断导致的静默丢包
         pool_recycle=settings.mysql_pool_recycle_s,
         echo=settings.debug,
+        # 每次借用连接前执行 "SELECT 1"，无效则重连
         pool_pre_ping=True
     )
     _session_maker = async_sessionmaker(
@@ -122,7 +124,6 @@ async def create_all_tables() -> None:
     Warning:
         该操作是幂等的（已存在的表不会被修改），但不会自动处理字段变更
     """
-    # 前置条件检查：必须先初始化引擎才能操作 metadata
     if _engine is None:
         raise RuntimeError("Database not initialized.")
 

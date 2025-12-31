@@ -2,7 +2,7 @@
 # ============================================================================
 # General - 通用配置
 # ============================================================================
-version = "0.1.0"
+version = "0.2.0"  # 升级版本号以匹配 Piko 2.0
 
 # ============================================================================
 # Startup Strategy - 启动策略
@@ -16,31 +16,39 @@ startup_mode = "fail_closed"
 debug = false
 
 # ============================================================================
-# Database - 数据库连接配置
+# Database - 数据库连接配置 (Piko 2.0 核心)
 # ============================================================================
 # [注意] 库内部默认留空，配合 init_db 的检查逻辑。
 # 这样用户如果没配置环境变量，启动时会看到友好的 FATAL ERROR 提示
-# mysql_dsn 格式示例: "mysql+pymysql://user:pass@host:port/dbname?charset=utf8mb4"
+#
+# ⚠️ [Piko 2.0 重要变更] 必须使用异步驱动！
+# 推荐使用 mysql+asyncmy (速度最快) 或 mysql+aiomysql (兼容性好)
+# ❌ 不要使用 pymysql (这是同步驱动，会阻塞 Event Loop)
+#
+# 格式示例:
+#   "mysql+asyncmy://user:pass@host:port/dbname?charset=utf8mb4"
 mysql_dsn = ""
 
 # mysql_pool_size: 连接池初始大小，影响并发能力
-# 设为 10 是基于典型中小型服务的经验值，可根据实际并发量调整
-mysql_pool_size = 10
+# 设为 10-20 是基于典型中小型服务的经验值
+mysql_pool_size = 20
 
 # mysql_max_overflow: 连接池最大溢出连接数
 # 允许在高峰期临时创建额外连接，避免请求阻塞
 mysql_max_overflow = 10
 
 # mysql_pool_recycle_s: 连接回收时间（秒）
-# MySQL 默认 wait_timeout 为 28800 秒（8小时），这里设为 1800 秒（30分钟）
-# 提前回收可防止使用已被服务端关闭的"僵尸连接"，避免 "MySQL server has gone away" 错误
-mysql_pool_recycle_s = 1800
+# 强制每 3600 秒回收一次连接，防止连接存在太久被防火墙/MySQL服务端切断
+# 这配合代码中的 pool_pre_ping=True 共同解决了 "Lost connection" 问题
+mysql_pool_recycle_s = 3600
 
 # ============================================================================
 # Scheduler Tuning - 调度器调优参数
 # ============================================================================
 # poll_interval_s: 主轮询间隔（秒）
-# 决定调度器多久检查一次新任务，值越小响应越快但 CPU 开销越大
+# [Piko 2.0 新特性] 这是"默认"间隔。
+# 系统启动后，ConfigWatcher 会优先读取数据库中的 piko_system_settings 配置。
+# 如果数据库没配置，才使用此值。
 poll_interval_s = 10
 
 # poll_jitter_s: 轮询抖动时间（秒）
