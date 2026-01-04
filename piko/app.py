@@ -1,7 +1,8 @@
 import asyncio
+import importlib
 import signal
 from contextlib import asynccontextmanager
-from typing import Type, Dict
+from typing import Type, Dict, List
 
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -47,32 +48,20 @@ class PikoApp:
         cpu_manager (CpuManager): CPU 计算池管理器
         api_app (FastAPI): 内置的 FastAPI 实例（用于监控和运维）
         _shutdown_event (asyncio.Event): 关闭信号事件
-
-    Methods:
-        startup: 六阶段启动流程（日志 -> 数据库 -> Workers -> Leader -> Watcher -> 调度器）
-        shutdown: 五阶段关闭流程（调度器 -> Watcher -> Leader -> 持久化 -> Workers）
-        run_forever: CLI 入口点，启动后等待关闭信号
-        job: 任务注册装饰器
-
-    Note:
-        核心设计原则（启动/关闭顺序）：
-        1. 严格顺序：启动和关闭流程有严格的依赖顺序，错误的顺序会导致数据丢失或报错
-           例如：必须先停止调度器再停止持久化，否则调度器产生的新数据无法写入
-        2. 优雅关闭：收到信号后，会等待所有正在进行的任务完成后再退出
-        3. 依赖注入：核心组件在 __init__ 中组装，避免全局变量污染
     """
 
-    def __init__(self, name: str = "piko"):
+    def __init__(self, name: str = "piko", modules: List[str] | None = None):
         """初始化 Piko 应用程序
 
         Args:
             name (str): 应用程序名称，将用于日志和 API 文档标题
+            modules (List[str] | None): 需要自动加载的模块路径列表（用于触发任务注册）
         """
         self.name = name
         self._shutdown_event = asyncio.Event()
 
         # ==========================================================
-        # 1. 实例化核心组件 (无副作用)
+        # 1. 实例化核心组件
         # ==========================================================
         self.registry = JobRegistry()
         self.config_cache = ConfigCache()
@@ -109,6 +98,30 @@ class PikoApp:
         # ==========================================================
         self.api_app = FastAPI(lifespan=self._lifespan_context, title=f"{name} Worker")
         self._register_api_routes()
+
+        # ==========================================================
+        # 4. 加载模块 (如果有)
+        # ==========================================================
+        if modules:
+            self.load_modules(modules)
+
+    def load_modules(self, modules: List[str]):
+        """动态加载模块以触发任务注册
+
+        Args:
+            modules (List[str]): 模块路径列表，例如 ["my_project.jobs.etl", "my_project.jobs.crawler"]
+
+        Raises:
+            ImportError: 当模块路径不存在或导入失败时抛出
+        """
+        for module_path in modules:
+            try:
+                importlib.import_module(module_path)
+                logger.info("module_loaded", module=module_path)
+            except ImportError as e:
+                logger.error("module_load_failed", module=module_path, error=str(e))
+                # 在启动阶段，任何配置错误都应该立即报错退出
+                raise
 
     def _register_api_routes(self):
         """注册内置的运维 API 路由"""
@@ -174,67 +187,43 @@ class PikoApp:
         )
 
     async def startup(self):
-        """执行应用启动流程（六阶段）
-
-        启动顺序：
-        1. 初始化日志系统（确保最早捕获日志）
-        2. 初始化数据库和表结构（基础设施就绪）
-        3. 启动工作组件（计算池、持久化写入器）
-        4. 启动 Leader 选举（决定当前节点角色）
-        5. 启动配置监视器（同步任务配置）
-        6. 启动调度器（开始触发任务）
-
-        Note:
-            - 必须按此顺序执行，否则会导致依赖错误
-            - 例如：ConfigWatcher 依赖数据库，Scheduler 依赖 ConfigWatcher 同步的任务
-        """
+        """执行应用启动流程（六阶段）"""
         # 0. 初始化日志（最先执行）
         setup_logging()
         logger.info("piko_app_startup", app=self.name, version=settings.version)
 
-        # 1. 基础设施层
-        init_db()
-        # 自动创建表（开发模式便利性，生产环境建议用 Alembic）
-        await create_all_tables()
+        try:
+            # 1. 基础设施层
+            init_db()
+            await create_all_tables()
 
-        # 初始化 Leader 种子数据
-        if settings.leader_enabled:
-            await get_leader_mutex().ensure_seed()
+            # 初始化 Leader 种子数据
+            if settings.leader_enabled:
+                await get_leader_mutex().ensure_seed()
 
-        # 2. Worker 层
-        self.cpu_manager.startup()
-        await self.writer.start()
+            # 2. Worker 层
+            self.cpu_manager.startup()
+            await self.writer.start()
 
-        # 3. Leader 层
-        if settings.leader_enabled:
-            # 尝试抢占 Leader
-            is_leader = await get_leader_mutex().try_acquire()
-            logger.info("leader_election", is_leader=is_leader)
-            # 启动看门dog（自动续约/抢占）
-            await get_leader_watchdog().start()
+            # 3. Leader 层
+            if settings.leader_enabled:
+                is_leader = await get_leader_mutex().try_acquire()
+                logger.info("leader_election", is_leader=is_leader)
+                await get_leader_watchdog().start()
 
-        # 4. Watcher 层
-        await self.watcher.start()
+            # 4. Watcher 层
+            await self.watcher.start()
 
-        # 5. Scheduler 层
-        self.scheduler.startup()
+            # 5. Scheduler 层
+            self.scheduler.startup()
 
-        logger.info("piko_app_started")
+            logger.info("piko_app_started")
+        except Exception as e:
+            logger.critical("piko_startup_unexpected_error", error=str(e))
+            raise e
 
     async def shutdown(self):
-        """执行应用关闭流程（逆序关闭）
-
-        关闭顺序（与启动相反）：
-        1. 停止调度器（不再产生新任务）
-        2. 停止配置监视器（不再同步变更）
-        3. 停止 Leader 看门doc并释放锁（主动让位）
-        4. 停止持久化写入器（刷盘残留数据）
-        5. 关闭计算池（等待计算任务完成）
-
-        Note:
-            - 逆序关闭是为了防止数据丢失和报错
-            - 重点关注 persistence_writer.stop()，它会等待队列清空
-        """
+        """执行应用关闭流程（逆序关闭）"""
         logger.info("piko_app_shutdown_begin")
 
         # 1. 停止调度器
@@ -246,7 +235,6 @@ class PikoApp:
         # 3. 停止 Leader 机制
         if settings.leader_enabled:
             await get_leader_watchdog().stop()
-            # 主动释放锁，让其他节点立即接管
             await get_leader_mutex().release()
 
         # 4. 停止持久化（关键：刷盘）
@@ -259,11 +247,6 @@ class PikoApp:
 
     @asynccontextmanager
     async def _lifespan_context(self, _app: FastAPI):
-        """FastAPI Lifespan 上下文管理器适配器
-
-        将 Piko 的启动/关闭流程集成到 FastAPI 应用中，
-        使得 PikoApp 可以被 uvicorn 等 ASGI 服务器托管。
-        """
         await self.startup()
         try:
             yield
@@ -272,39 +255,20 @@ class PikoApp:
 
     @property
     def lifespan(self):
-        """公开的 lifespan 属性，供外部 FastAPI 使用"""
         return self._lifespan_context
 
     async def run_forever(self):
-        """CLI 运行主入口（阻塞直到收到信号）
-
-        注册信号处理器（SIGINT/SIGTERM），启动应用，然后挂起等待关闭信号
-
-        Note:
-            - 适用于 Docker 容器或 Systemd 服务
-            - 收到信号后会触发优雅关闭流程
-        """
-        # 启动应用
+        """CLI 运行主入口（阻塞直到收到信号）"""
         await self.startup()
 
-        # 获取当前事件循环
         loop = asyncio.get_running_loop()
-
-        # 注册信号处理器
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
 
         logger.info("piko_running_wait_for_signal")
-
-        # 挂起主协程，直到收到信号
         await self._shutdown_event.wait()
-
-        # 收到信号后，执行关闭
         await self.shutdown()
 
     def run(self):
-        """同步运行入口（开发调试便利方法）
-
-        封装了 asyncio.run(run_forever())，方便在 main.py 中直接调用
-        """
+        """同步运行入口（开发调试便利方法）"""
         asyncio.run(self.run_forever())

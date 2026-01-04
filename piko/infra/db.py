@@ -1,5 +1,4 @@
 import datetime
-import sys
 from typing import Any, AsyncGenerator
 
 from sqlalchemy import (
@@ -67,7 +66,9 @@ def init_db() -> None:
     dsn = settings.get("mysql_dsn", "")
     if not dsn or str(dsn).strip() == "":
         logger.critical("startup_config_missing", field="mysql_dsn")
-        sys.exit(1)
+        raise ValueError(
+            "CRITICAL: MySQL DSN is missing. Please set env var or add mysql_dsn to settings.toml."
+        )
 
     _engine = create_async_engine(
         settings.mysql_dsn,
