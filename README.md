@@ -1,330 +1,816 @@
-# Piko: Enterprise-Grade Async Orchestrator
+# Piko - Data-Oriented Async Task Orchestrator
 
 [![PyPI version](https://img.shields.io/pypi/v/piko-cucc.svg)](https://pypi.org/project/piko-cucc/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Piko 专为数据工程设计，旨在解决**高并发 I/O** 与**复杂资源管理**之间的矛盾，通过**微内核设计**与**依赖注入**机制，让开发者能够轻松构建支撑数万 QPS 的流水线。
+> 一个面向 **数据任务（ETL / 同步 / 扫描 / 归档 / 监控）** 的异步并发编排框架： 
+> 
+> **代码里写任务（Job），数据库里配调度与参数（Schedule/Config），运行时自动热更新，天然支持异步高并发与可观测性。**
 
 ---
 
-## 🔥 Piko 0.1.6 新特性 (New in v0.1.6)
+## 目录
 
-- **App 实例模式**: `app = PikoApp()`，彻底告别隐式全局变量，支持多实例运行。
-- **动态系统配置**: 支持在不重启服务的情况下，通过数据库动态调整轮询间隔等系统参数。
-- **增强的连接池**: 自动探活与断线重连（Pre-ping），适应不稳定的网络环境。
-- **智能回填策略**: 支持 `SKIP` (跳过) 和 `CATCH_UP` (追赶) 等多种回溯策略。
+- [为什么是 Piko](#为什么是-piko)
+- [核心特性](#核心特性)
+- [30 秒上手](#30-秒上手)
+- [基础概念速览](#基础概念速览)
+- [大量示例：异步 / 并发 / 异步并发](#大量示例异步--并发--异步并发)
+  - [示例 1：最小 Job + DB 调度](#示例-1最小-job--db-调度)
+  - [示例 2：并发抓取 HTTP（有界并发 + 超时）](#示例-2并发抓取-http有界并发--超时)
+  - [示例 3：并发扇出/扇入（fan-out / fan-in）](#示例-3并发扇出扇入fan-out--fan-in)
+  - [示例 4：生产者-消费者（asyncio.Queue 背压）](#示例-4生产者-消费者asyncioqueue-背压)
+  - [示例 5：异步 I/O + CPU 混合流水线（ProcessPool MapReduce）](#示例-5异步-io--cpu-混合流水线processpool-mapreduce)
+  - [示例 6：把同步阻塞库变成“异步可并发”](#示例-6把同步阻塞库变成异步可并发)
+  - [示例 7：有状态任务（水位线 + 自动补跑）](#示例-7有状态任务水位线--自动补跑)
+  - [示例 8：资源依赖注入 Resource（连接池/客户端自动释放）](#示例-8资源依赖注入-resource连接池客户端自动释放)
+  - [示例 9：自定义 Resource（你想注入什么都行）](#示例-9自定义-resource你想注入什么都行)
+  - [示例 10：持久化写入（队列缓冲 + 批量写 + 磁盘兜底）](#示例-10持久化写入队列缓冲--批量写--磁盘兜底)
+  - [示例 11：TypedSink 类型路由（不同模型不同写法）](#示例-11typedsink-类型路由不同模型不同写法)
+  - [示例 12：定时任务三种触发器（cron/interval/date）](#示例-12定时任务三种触发器cronintervaldate)
+  - [示例 13：动态配置热更新（灰度生效 effective_from）](#示例-13动态配置热更新灰度生效-effective_from)
+  - [示例 14：多实例部署（Leader Election）](#示例-14多实例部署leader-election)
+- [配置](#配置)
+- [运维端点与可观测性](#运维端点与可观测性)
+- [项目结构建议](#项目结构建议)
+- [FAQ](#faq)
 
 ---
 
-## 前置要求 (Prerequisites)
+## 为什么是 Piko
 
-Piko 依赖 **MySQL** (5.7 或 8.0+) 作为核心组件。
+当你在生产里做“数据任务/同步任务”时，通常会遇到这些痛点：
 
-```sql
-# 创建数据库
-CREATE DATABASE piko_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
+- 任务是 **asyncio** 的，但调度、并发、资源生命周期、幂等锁、补跑、观测……要自己拼很多代码
+- 任务参数经常变，想做到 **在线改配置、灰度生效、无需发版**
+- 多实例部署时，需要 **只让一个实例真正执行调度**（Leader/Follower）
+- 高并发抓取/同步时，需要 **有界并发**（不炸库、不打爆下游、不 OOM）
+- 任务写入落库/发 MQ 等常常成为瓶颈，需要 **队列缓冲、批量写、背压、兜底**
 
-## 安装 (Installation)
+Piko 把这些能力做成“框架默认能力”，你只需要专注写业务 Job。
+
+---
+
+## 核心特性
+
+**Piko 的核心设计**： 
+✅ **代码注册任务**（白名单模式） + ✅ **数据库配置调度/参数** + ✅ **运行时 Reconcile 热更新**
+
+- **异步任务模型**：任务必须是 `async def`，天然支持 asyncio 高并发
+- **DB 驱动调度**：`scheduled_job` 表配置 cron/interval/date，`job_config` 表配置参数（支持版本、灰度生效）
+- **运行时自动热更新**：`ConfigWatcher` 周期性 reconcile DB → 内存缓存 → APScheduler（无需重启）
+- **幂等锁**：`job_lock` 防止同一 job 在同一 scheduled_time 上重复执行
+- **有状态任务**：维护水位线 `last_data_time`，支持 **自动补跑**（Backfill）
+- **资源依赖注入（Resource）**：用 `asynccontextmanager` 管理连接池/客户端，任务结束自动释放
+- **CPU 计算池（多进程）**：`CpuManager` 支持 `submit` / `map_reduce`，绕过 GIL 做 CPU 并行
+- **持久化写入引擎**：`PersistenceWriter` 队列缓冲 + 批量聚合 + 背压 + 磁盘兜底恢复
+- **内置运维 API**：`/healthz` `/readyz` `/metrics`（FastAPI + Prometheus）
+- **分布式 Leader Election**：基于 DB 租约 + CAS 乐观锁，多实例下只有 Leader 执行调度
+
+---
+
+## 30 秒上手
+
+> 你需要一个 MySQL（Piko 用它存调度、配置、幂等锁、运行记录等元数据）。
+
+### 1) 安装
 
 ```bash
-pip install piko-cucc
+# uv（推荐）
+uv pip install piko-cucc
 ```
 
-------
+### 2) 配置 MySQL DSN
 
-## 快速开始 (Quick Start)
+```bash
+export PIKO_MYSQL_DSN="mysql+asyncmy://user:pass@127.0.0.1:3306/piko?charset=utf8mb4"
+```
 
-### 1. 定义应用 (`app.py`)
+> 也可以写到 `settings.toml / piko.toml`，或用 `PIKO_SETTINGS_PATH` 指向自定义配置文件。
 
-Piko 强制要求显式实例化 App 对象。
+### 3) 写一个 Job，然后跑起来
 
 ```python
-from piko.app import PikoApp
+# app.py
+from piko import PikoApp
 
-# 实例化 App
-app = PikoApp(name="my_crawler_service")
-```
+app = PikoApp(name="demo")
+api_app = app.api_app
 
-### 2. 编写任务 (`jobs.py`)
-
-使用 `@app.job` 装饰器注册任务。
-
-```Python
-from .app import app
-
-@app.job(
-    job_id="hello_world",
-    cron="* * * * *"  # 每分钟执行
-)
-async def hello_handler(ctx, scheduled_time):
-    print(f"Hello Piko ! Time: {scheduled_time}")
-```
-
-### 3. 启动入口 (`main.py`)
-
-```python
-from my_project.app import app
-import my_project.jobs  # 必须导入任务模块以触发注册
+@app.job(job_id="hello_job")
+async def hello(ctx, scheduled_time):
+    print("hello", ctx["run_id"], scheduled_time)
 
 if __name__ == "__main__":
-    # 一键启动：自动处理 DB 初始化、Leader 选举、Worker 启动
     app.run()
 ```
 
-------
+启动：
 
-## 核心模式 (Core Patterns)
+```bash
+python app.py
+# 或 ASGI：
+# uvicorn app:api_app --reload
+```
 
-### 场景一：高并发网络 I/O (The Async IO Pattern)
+然后在 DB 插入一条调度：
 
-利用 `asyncio` 原生并发能力，单节点轻松支撑数千并发。
+```sql
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("hello_job", "interval", '{"seconds": 10}', 1, 1)
+ON DUPLICATE KEY UPDATE enabled=1, schedule_expr='{"seconds":10}', version=version+1;
+```
+
+---
+
+## 基础概念速览
+
+### Job（任务）
+
+- 用 `@app.job(job_id=...)` 注册（白名单）
+- 函数签名：`async def handler(ctx, scheduled_time, **resources)`
+- `ctx` 里至少包含：
+  - `ctx["run_id"]`：本次执行记录 ID（job_run.run_id）
+  - `ctx["job_id"]`：任务 ID
+  - `ctx["config"]`：任务配置（dict 或 Pydantic Model）
+  - 若是有状态任务：`ctx["data_interval"]`（`DataInterval`）
+
+### 调度与参数（DB）
+
+- `scheduled_job`：配置触发器（cron/interval/date）
+- `job_config`：配置参数（版本化、灰度生效 `effective_from`）
+- `job_run`：执行记录（状态、耗时、错误）
+- `job_lock`：幂等锁（同 job_id + scheduled_time 只允许一个实例执行）
+
+---
+
+# 示例：异步 / 并发 / 异步并发
+
+下面的示例尽量都遵循同一个模式：**你写 job，Piko 负责调度/幂等/资源/观测**。你可以直接复制这些片段到自己的 `jobs.py` 中使用。
+
+---
+
+## 示例 1：最小 Job + DB 调度
 
 ```python
-import aiohttp
-from .app import app
+from piko import PikoApp
 
-@app.job(job_id="fetch_price", cron="*/1 * * * *")
-async def fetch_handler(ctx, scheduled_time):
-    # 纯异步非阻塞
-    async with aiohttp.ClientSession() as session:
-        async with session.get("[https://api.example.com/data](https://api.example.com/data)") as resp:
-            data = await resp.json()
-            print(f"Data: {data}")
+app = PikoApp(name="mini")
+api_app = app.api_app
+
+@app.job(job_id="mini_job")
+async def mini_job(ctx, scheduled_time):
+    # ctx["config"] 默认为 {}，如果你没在 job_config 表里配置
+    print("run_id=", ctx["run_id"], "scheduled_time=", scheduled_time, "config=", ctx["config"])
 ```
 
-### 场景二：资源依赖注入 (Dependency Injection)
+DB：
 
-通过 `resources` 参数注入连接池，自动管理生命周期，防止资源泄露。
+```sql
+-- 每 5 秒触发一次
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("mini_job", "interval", '{"seconds": 5}', 1, 1)
+ON DUPLICATE KEY UPDATE enabled=1, schedule_expr='{"seconds":5}', version=version+1;
+```
 
-```Python
-from piko.core.resource import Resource
+---
+
+## 示例 2：并发抓取 HTTP（有界并发 + 超时）
+
+场景：你要扫一堆 URL，**并发抓取**，但要避免瞬间打爆下游（有界并发）。
+
+```python
+import asyncio
+import httpx
+from piko import PikoApp
+
+app = PikoApp("http_sweeper")
+api_app = app.api_app
+
+URLS = [
+    "https://example.com",
+    "https://www.python.org",
+    # ...
+]
+
+@app.job(job_id="sweep_http")
+async def sweep_http(ctx, scheduled_time):
+    concurrency = 50
+    sem = asyncio.Semaphore(concurrency)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        async def fetch(url: str):
+            async with sem:
+                r = await client.get(url)
+                return url, r.status_code, len(r.content)
+
+        # 关键点：gather + semaphore = 有界并发
+        results = await asyncio.gather(*(fetch(u) for u in URLS), return_exceptions=True)
+
+    ok = [x for x in results if not isinstance(x, Exception)]
+    print("ok=", len(ok), "total=", len(results))
+```
+
+要点：
+
+- **Semaphore** 控制并发度（避免把带宽/连接池/下游打爆）
+- httpx 是异步 I/O，`gather` 会把等待 I/O 的时间“让出”给别的协程
+
+---
+
+## 示例 3：并发扇出/扇入（fan-out / fan-in）
+
+场景：一条任务输入 → 并发处理 N 份子任务 → 汇总结果。
+
+```python
+import asyncio
+from piko import PikoApp
+
+app = PikoApp("fanout")
+api_app = app.api_app
+
+@app.job(job_id="fanout_fanin")
+async def fanout_fanin(ctx, scheduled_time):
+    items = list(range(1, 501))
+
+    async def work(x: int) -> int:
+        # 模拟 I/O
+        await asyncio.sleep(0.01)
+        return x * x
+
+    # 扇出：并发执行
+    results = await asyncio.gather(*(work(x) for x in items))
+
+    # 扇入：汇总
+    total = sum(results)
+    print("sum=", total)
+```
+
+---
+
+## 示例 4：生产者-消费者（asyncio.Queue 背压）
+
+场景：抓取（快）+ 处理（慢），需要 **队列缓冲** + **背压**（Queue 有界）。
+
+```python
+import asyncio
+from piko import PikoApp
+
+app = PikoApp("queue_pipeline")
+api_app = app.api_app
+
+@app.job(job_id="producer_consumer")
+async def producer_consumer(ctx, scheduled_time):
+    # 有界队列 = 背压点
+    q: asyncio.Queue[int] = asyncio.Queue(maxsize=200)
+    concurrency = 20
+
+    async def producer():
+        for i in range(5000):
+            # 队列满会阻塞（异步阻塞，不占线程）
+            await q.put(i)
+        for _ in range(concurrency):
+            # 结束信号
+            await q.put(-1)
+
+    async def consumer(worker_id: int):
+        processed = 0
+        while True:
+            x = await q.get()
+            try:
+                if x == -1:
+                    return processed
+                # 模拟 I/O 或业务处理
+                await asyncio.sleep(0.002)
+                processed += 1
+            finally:
+                q.task_done()
+
+    consumers = [asyncio.create_task(consumer(i)) for i in range(concurrency)]
+    prod_task = asyncio.create_task(producer())
+
+    await prod_task
+    # 等待队列处理完
+    await q.join()
+    stats = await asyncio.gather(*consumers)
+
+    print("total_processed=", sum(stats))
+```
+
+要点：
+
+- `Queue(maxsize=N)` = **背压**：生产太快会自动阻塞，防止 OOM
+- `q.join()` + `task_done()` = 可靠等待“处理完”
+
+---
+
+## 示例 5：异步 I/O + CPU 混合流水线（ProcessPool MapReduce）
+
+场景：先异步下载/读取数据，再做 CPU 重计算（比如解压、解析、特征提取）。
+
+Piko 内置 `CpuManager`（多进程）：
+
+```python
+import math
+from piko import PikoApp
+
+app = PikoApp("io_cpu_mix")
+api_app = app.api_app
+
+def heavy_cpu(x: int) -> int:
+    # CPU 密集：会占满 GIL（所以要多进程）
+    math.factorial(2000)
+    return x * x
+
+@app.job(job_id="io_plus_cpu")
+async def io_plus_cpu(ctx, scheduled_time):
+    items = list(range(1000))
+
+    # MapReduce：在多个子进程并行执行 heavy_cpu
+    results = await app.cpu_manager.map_reduce(
+        map_fn=heavy_cpu,
+        items=items,
+        # 控制并行进程任务数
+        concurrency=4,
+    )
+
+    print("done:", len(results), "sample:", results[0])
+```
+
+> 这个场景经常遇到：**异步 I/O 把数据拉回来 → 多进程做 CPU 重活 → 异步写出去**。
+
+---
+
+## 示例 6：把同步阻塞库变成“异步可并发”
+
+场景：你依赖一个同步 SDK（例如某些老库/驱动/算法），但你想在 asyncio 下并发调用。
+
+两种办法：
+
+### 6.1 用 `asyncio.to_thread`（适合 I/O 或轻 CPU）
+
+```python
+import asyncio
+from piko import PikoApp
+
+app = PikoApp("sync_to_async")
+api_app = app.api_app
+
+def blocking_call(x: int) -> int:
+    # 模拟同步阻塞
+    import time
+    time.sleep(0.05)
+    return x + 1
+
+@app.job(job_id="to_thread_demo")
+async def to_thread_demo(ctx, scheduled_time):
+    sem = asyncio.Semaphore(100)
+
+    async def run_one(x: int):
+        async with sem:
+            return await asyncio.to_thread(blocking_call, x)
+
+    results = await asyncio.gather(*(run_one(i) for i in range(1000)))
+    print("done", len(results))
+```
+
+### 6.2 用 `app.cpu_manager.submit`（适合 CPU 重活，需要绕过 GIL）
+
+```python
+from piko import PikoApp
+
+app = PikoApp("cpu_submit")
+api_app = app.api_app
+
+def cpu_heavy(x: int) -> int:
+    import math
+    math.factorial(3000)
+    return x * 2
+
+@app.job(job_id="cpu_submit_demo")
+async def cpu_submit_demo(ctx, scheduled_time):
+    res = await app.cpu_manager.submit(cpu_heavy, 21)
+    print("res=", res)
+```
+
+---
+
+## 示例 7：有状态任务（水位线 + 自动补跑）
+
+场景：每小时同步一次数据，服务停机 3 小时后重启，要补齐漏掉的数据窗口。
+
+Piko 通过以下手段来实现：
+
+- `@app.job(..., stateful=True, backfill_policy=...)`
+- `scheduled_job.last_data_time` 水位线（成功后自动更新）
+
+```python
+from piko import PikoApp
+from piko.core.types import BackfillPolicy, DataInterval
+
+app = PikoApp("stateful")
+api_app = app.api_app
+
+@app.job(job_id="sync_orders", stateful=True, backfill_policy=BackfillPolicy.CATCH_UP)
+async def sync_orders(ctx, scheduled_time):
+    interval: DataInterval = ctx["data_interval"]
+    print("sync window:", interval.start, "->", interval.end)
+
+    # 你的增量逻辑：WHERE updated_at >= start AND updated_at < end
+    # await do_incremental_sync(interval.start, interval.end)
+```
+
+调度（每小时一次）：
+
+```sql
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("sync_orders", "cron", '{"minute": 0}', 1, 1)
+ON DUPLICATE KEY UPDATE enabled=1, schedule_expr='{"minute":0}', version=version+1;
+```
+
+补跑策略说明：
+
+- `BackfillPolicy.CATCH_UP`：补齐所有漏掉的窗口（数据完整性优先）
+- `BackfillPolicy.SKIP`：只跑最新窗口（实时性优先）
+
+---
+
+## 示例 8：资源依赖注入 Resource（连接池/客户端自动释放）
+
+Resource 的本质：**一个异步上下文管理器工厂**。 Piko 在每次 job 执行时会用 `AsyncExitStack` 自动 enter/exit，确保资源释放。
+
+### 8.1 定义一个 Resource（例如 HTTP Client）
+
+```python
 from contextlib import asynccontextmanager
+import httpx
+from piko.core.resource import resource
 
-class DBPool(Resource):
+@resource
+class HttpClientResource:
     @asynccontextmanager
     async def acquire(self, ctx):
-        # 模拟借出连接
-        yield "db_connection_obj"
+        async with httpx.AsyncClient(timeout=10) as client:
+            yield client
+```
+
+### 8.2 在 job 里声明并注入
+
+```python
+import asyncio
+from piko import PikoApp
+
+app = PikoApp("resource_di")
+api_app = app.api_app
 
 @app.job(
-    job_id="db_task",
-    cron="0 * * * *",
-    resources={"db": DBPool}  # 注入资源
+    job_id="fetch_with_resource",
+    resources={"client": HttpClientResource},
 )
-async def db_handler(ctx, scheduled_time, db):
-    # db 参数由框架自动注入
-    print(f"Using connection: {db}")
+async def fetch_with_resource(ctx, scheduled_time, client):
+    # client 是被注入的 httpx.AsyncClient
+    urls = ["https://example.com"] * 100
+    sem = asyncio.Semaphore(50)
+
+    async def fetch(url):
+        async with sem:
+            r = await client.get(url)
+            return r.status_code
+
+    codes = await asyncio.gather(*(fetch(u) for u in urls))
+    print("200_count=", sum(1 for c in codes if c == 200))
 ```
 
-### 场景三：动态系统调优 (Dynamic Configuration)
+---
 
-Piko 允许你通过数据库动态调整系统行为。
+## 示例 9：自定义 Resource（你想注入什么都行）
 
-在 `job_config` 表中插入特殊 ID `piko_system_settings`：
+下面是三个最常见的 Resource 形态：**连接池 / SDK Client / 共享缓存**。
 
-```json
-// job_id: piko_system_settings
-{
-    "poll_interval_s": 5,   // 将轮询间隔调整为 5 秒
-    "log_level": "DEBUG"
-}
+### 9.1 注入 Redis（示意）
+
+```python
+from contextlib import asynccontextmanager
+from piko.core.resource import resource
+
+@resource
+class RedisResource:
+    @asynccontextmanager
+    async def acquire(self, ctx):
+        # 这里用伪代码示意
+        # import redis.asyncio as redis
+        # client = redis.Redis.from_url("redis://127.0.0.1:6379/0")
+        # try:
+        #     yield client
+        # finally:
+        #     await client.close()
+        yield object()
 ```
 
-Watcher 会自动感知并应用新配置，无需重启服务。
+### 9.2 注入 Mongo / ES / MQ / 任何你自己的 Client
 
-------
+你只要保证：
 
-## 配置 (Configuration)
+- `acquire(ctx)` 返回一个 async contextmanager
+- `yield` 出你希望注入到 job 的实例
+- `finally` 里把连接关闭/释放即可
 
-推荐使用 `settings.toml` 或环境变量。格式如下：
+---
+
+## 示例 10：持久化写入（队列缓冲 + 批量写 + 磁盘兜底）
+
+Piko 的 `PersistenceWriter` 是一个“生产者-消费者”写入引擎：
+
+- job 里 enqueue（快）
+- writer 后台批量 flush 到 sink（可控）
+- 写失败会 dump 到磁盘，启动时自动恢复
+
+### 10.1 写一个最小 Sink
+
+```python
+from piko.persistence.sink_base import ResultSink
+from piko.persistence.intent import WriteIntent
+
+class PrintSink(ResultSink):
+    def __init__(self):
+        super().__init__(name="print")
+
+    async def write_batch(self, batch: list[WriteIntent]):
+        for intent in batch:
+            print("[SINK]", intent.key, intent.payload)
+```
+
+### 10.2 注册 Sink，并在 job 中 enqueue
+
+```python
+from piko import PikoApp
+from piko.persistence.intent import WriteIntent
+
+app = PikoApp("persist_demo")
+api_app = app.api_app
+
+# 在应用启动时注册 sink（建议写在 main 模块里）
+app.writer.register_sink(PrintSink())
+
+@app.job(job_id="produce_intents")
+async def produce_intents(ctx, scheduled_time):
+    for i in range(1000):
+        intent = WriteIntent(
+            sink="print",
+            key=str(i),
+            payload={"i": i},
+            job_id=ctx["job_id"],
+            run_id=ctx["run_id"],
+            scheduled_time=scheduled_time,
+        )
+        # 队列满会背压阻塞（异步阻塞）
+        await app.writer.enqueue(intent)
+```
+
+---
+
+## 示例 11：TypedSink 类型路由（不同模型不同写法）
+
+如果你的 payload 是不同的 Pydantic Model，希望不同类型走不同写入逻辑：
+
+```python
+from pydantic import BaseModel
+from piko.persistence.sink_base import TypedSink, on
+from piko.persistence.intent import WriteIntent
+
+class User(BaseModel):
+    id: int
+    name: str
+
+class Order(BaseModel):
+    id: int
+    amount: float
+
+class MyTypedSink(TypedSink):
+    def __init__(self):
+        super().__init__(name="typed")
+
+    @on(User)
+    async def write_users(self, users: list[User]):
+        print("users:", len(users))
+
+    @on(Order)
+    async def write_orders(self, orders: list[Order]):
+        print("orders:", len(orders))
+```
+
+在 job 里 enqueue：
+
+```python
+from piko import PikoApp
+from piko.persistence.intent import WriteIntent
+
+app = PikoApp("typed_sink_demo")
+api_app = app.api_app
+app.writer.register_sink(MyTypedSink())
+
+@app.job(job_id="emit_models")
+async def emit_models(ctx, scheduled_time):
+    await app.writer.enqueue(WriteIntent(
+        sink="typed",
+        key="u1",
+        payload=User(id=1, name="alice"),
+        job_id=ctx["job_id"],
+        run_id=ctx["run_id"],
+        scheduled_time=scheduled_time,
+    ))
+    await app.writer.enqueue(WriteIntent(
+        sink="typed",
+        key="o1",
+        payload=Order(id=1, amount=9.9),
+        job_id=ctx["job_id"],
+        run_id=ctx["run_id"],
+        scheduled_time=scheduled_time,
+    ))
+```
+
+---
+
+## 示例 12：定时任务三种触发器（cron/interval/date）
+
+`scheduled_job.schedule_type` 支持：
+
+- `cron`：类似 crontab
+- `interval`：固定间隔
+- `date`：单次触发
+
+```sql
+-- cron：每天 02:30
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("daily_job", "cron", '{"hour": 2, "minute": 30}', 1, 1);
+
+-- interval：每 10 秒
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("fast_job", "interval", '{"seconds": 10}', 1, 1);
+
+-- date：2026-01-08 10:00 触发一次（注意时区由 settings.timezone 决定）
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("one_shot", "date", '{"run_date": "2026-01-08 10:00:00"}', 1, 1);
+```
+
+---
+
+## 示例 13：动态配置热更新（灰度生效 effective_from）
+
+在代码里声明 schema：
+
+```python
+from pydantic import BaseModel
+from piko import PikoApp
+
+app = PikoApp("cfg_demo")
+api_app = app.api_app
+
+class SweepConfig(BaseModel):
+    concurrency: int = 50
+    timeout_s: float = 10
+
+@app.job(job_id="sweep_cfg", schema=SweepConfig)
+async def sweep_cfg(ctx, scheduled_time):
+    cfg: SweepConfig = ctx["config"]  # 已被 Pydantic 校验 & 类型化
+    print("cfg:", cfg.concurrency, cfg.timeout_s)
+```
+
+在 DB 里更新参数（立即生效）：
+
+```sql
+INSERT INTO job_config(job_id, schema_version, config_json, version)
+VALUES ("sweep_cfg", 1, '{"concurrency": 200, "timeout_s": 3}', 1)
+ON DUPLICATE KEY UPDATE config_json='{"concurrency":200,"timeout_s":3}', version=version+1;
+```
+
+灰度生效（未来时间生效）：
+
+```sql
+UPDATE job_config
+SET config_json='{"concurrency":100,"timeout_s":5}',
+    effective_from = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 10 MINUTE),
+    version=version+1
+WHERE job_id="sweep_cfg";
+```
+
+---
+
+## 示例 14：多实例部署（Leader Election）
+
+多实例部署时，Piko 默认启用 Leader Election（基于 DB 租约）：
+
+- Leader 执行调度与 job run
+- Follower 返回 `/readyz: standby`
+
+配置项（可在 `settings.toml` 或环境变量中设置）：
 
 ```toml
 [default]
-# ============================================================================
-# General - 通用配置
-# ============================================================================
-version = "0.1.6"
-
-# ============================================================================
-# Startup Strategy - 启动策略
-# ============================================================================
-# startup_mode 控制服务启动时的容错行为：
-#   - "fail_closed": 严格模式，任何配置或依赖检查失败都立即终止启动（生产推荐）
-#   - "fail_open_snapshot": 宽容模式，允许使用快照数据降级启动（仅用于开发/测试）
-startup_mode = "fail_closed"
-
-# debug 模式会启用更详细的日志和调试端点，生产环境必须设为 false
-debug = false
-
-# ============================================================================
-# Database - 数据库连接配置 (Piko 核心)
-# ============================================================================
-# [注意] 库内部默认留空，配合 init_db 的检查逻辑。
-# 这样用户如果没配置环境变量，启动时会看到友好的 FATAL ERROR 提示
-# 
-# ⚠️ 必须使用异步驱动！
-# 推荐使用 mysql+asyncmy (速度最快) 或 mysql+aiomysql (兼容性好)
-# ❌ 不要使用 pymysql (这是同步驱动，会阻塞 Event Loop)
-#
-# 格式示例: 
-#   "mysql+asyncmy://user:pass@host:port/dbname?charset=utf8mb4"
-mysql_dsn = ""
-
-# mysql_pool_size: 连接池初始大小，影响并发能力
-# 设为 10-20 是基于典型中小型服务的经验值
-mysql_pool_size = 20
-
-# mysql_max_overflow: 连接池最大溢出连接数
-# 允许在高峰期临时创建额外连接，避免请求阻塞
-mysql_max_overflow = 10
-
-# mysql_pool_recycle_s: 连接回收时间（秒）
-# 强制每 3600 秒回收一次连接，防止连接存在太久被防火墙/MySQL服务端切断
-# 这配合代码中的 pool_pre_ping=True 共同解决了 "Lost connection" 问题
-mysql_pool_recycle_s = 3600
-
-# ============================================================================
-# Scheduler Tuning - 调度器调优参数
-# ============================================================================
-# poll_interval_s: 主轮询间隔（秒）
-# [Piko 新特性] 这是"默认"间隔。
-# 系统启动后，ConfigWatcher 会优先读取数据库中的 piko_system_settings 配置。
-# 如果数据库没配置，才使用此值。
-poll_interval_s = 10
-
-# poll_jitter_s: 轮询抖动时间（秒）
-# 随机化轮询时刻，避免多实例在同一时刻同时轮询造成数据库压力峰值
-poll_jitter_s = 2
-
-# debounce_s: 防抖窗口（秒）
-# 在此时间窗口内重复触发的相同任务会被合并，减少无效调度
-debounce_s = 2
-
-# timezone: 时区设置
-# 影响 cron 表达式的解析和任务触发时间计算，必须与业务时区一致
-timezone = "Asia/Shanghai"
-
-# ap_misfire_grace_s_default: APScheduler misfire 容忍时间（秒）
-# 任务错过预定时间后，在此时间窗口内仍会执行；超出则跳过
-# 300 秒（5分钟）是平衡及时性与系统压力的经验值
-ap_misfire_grace_s_default = 300
-
-# ap_max_instances_default: APScheduler 单任务最大并发实例数
-# 设为 1 防止同一任务的多个实例并发执行，避免数据竞争
-ap_max_instances_default = 1
-
-# ============================================================================
-# Leader Election - 分布式Leader选举
-# ============================================================================
-# leader_enabled: 是否启用Leader选举
-# 多实例部署时必须启用，确保只有一个实例执行调度逻辑
 leader_enabled = true
-
-# leader_name: Leader名称/组名
-# 同一组内的实例会竞争同一个Leader锁，不同组互不干扰
 leader_name = "default"
-
-# leader_lease_s: Leader租约时长（秒）
-# Leader必须在此时间内续租，否则被视为失效，其他实例可接管
 leader_lease_s = 30
-
-# leader_renew_interval_s: 续租间隔（秒）
-# Leader多久续租一次，必须小于 lease 时长且留有余量（当前为 1/3）
-# 这样即使某次续租失败，仍有时间在租约到期前重试
 leader_renew_interval_s = 10
-
-# ============================================================================
-# Concurrency & Compute - 并发与计算资源
-# ============================================================================
-# cpu_workers: CPU 密集型任务的工作线程数
-# 0 表示自动检测（通常为 CPU 核心数），可根据任务特性手动调整
-cpu_workers = 0
-
-# per_job_cpu_max: 单任务最大 CPU 并发数
-# 限制单个任务可使用的最大线程数，防止某个任务耗尽所有资源
-per_job_cpu_max = 8
-
-# ============================================================================
-# Persistence - 持久化与缓冲配置
-# ============================================================================
-# persist_queue_max: 持久化队列最大长度
-# 控制内存中待持久化对象的最大数量，防止内存溢出
-persist_queue_max = 200
-
-# persist_flush_timeout_s: 强制刷盘超时（秒）
-# 即使队列未满，也会在此时间后强制写入，平衡数据丢失风险与 I/O 效率
-persist_flush_timeout_s = 60
-
-# persist_disk_fallback_path: 磁盘降级备份路径
-# 当主存储（如数据库）不可用时，临时写入本地文件，防止数据丢失
-# 注意：此路径应在容器/主机重启后仍可访问（如挂载卷）
-persist_disk_fallback_path = "/tmp/piko_fallback.bin"
-
-# ============================================================================
-# Observability & Logging - 可观测性与日志
-# ============================================================================
-# metrics_enabled: 是否启用 Prometheus 等指标采集
-# 生产环境强烈建议启用，用于监控调度器健康状况
-metrics_enabled = true
-
-# health_port: 健康检查和指标暴露端口
-# K8s/Docker 可通过此端口进行 liveness/readiness probe
-health_port = 8080
-
-# log_level: 日志级别
-# 可选: DEBUG, INFO, WARNING, ERROR, CRITICAL
-# 生产环境建议 INFO，排查问题时临时调为 DEBUG
-log_level = "INFO"
-
-# log_json: 日志格式开关
-#   - true: 生产模式，输出结构化 JSON 日志，便于日志聚合平台解析
-#   - false: 开发模式，输出彩色文本日志，提升本地调试体验
-log_json = false
 ```
 
-## ⚙️ 进阶：动态系统配置 (Dynamic System Settings)
+常见部署方式：
 
-除了前面的配置文件或环境变量方式，Piko  还引入了 **“控制面与数据面分离”** 的设计理念。你还可以通过数据库实时调整系统的运行时行为，实现 **无停机调优 (Hot Reload)**。
+- Kubernetes 部署 2~3 个副本
+- Prometheus 抓取每个副本的 `/metrics`
+- 只有 Leader 的 job_run 会增长（Follower standby）
 
-这是通过在 `job_config` 表中插入一个特殊的保留任务 ID `piko_system_settings` 来实现的。
+---
 
-### 1. 静态 vs 动态配置对照表
+## 配置
 
-并不是所有配置都能放入数据库。请务必遵循以下规则，否则配置将无效：
+Piko 使用 Dynaconf，默认读取：
 
-| 配置分类                        | 典型参数                                                     | 存放位置                                          | 生效时机                  | 备注                                                         |
-| :------------------------------ | :----------------------------------------------------------- | :------------------------------------------------ | :------------------------ | :----------------------------------------------------------- |
-| **基础设施 (Infrastructure)**   | `mysql_dsn`<br>`mysql_pool_size`<br>`leader_name`<br>`startup_mode`<br>`timezone` | **仅** `settings.toml`<br>或 环境变量             | **启动时**                | 涉及连接池初始化、线程启动或时区基准，修改后**必须重启服务**。 |
-| **运行时策略 (Runtime Policy)** | `poll_interval_s`<br>`poll_jitter_s`<br>`log_level`<br>`per_job_cpu_max` | `settings.toml` (默认值)<br>**+ 数据库 (覆盖值)** | **即时生效**<br>(< 1分钟) | Watcher 会在下一次心跳时自动加载新值。                       |
+- `defaults.toml`（库内置）
+- `settings.toml` / `piko.toml` / `.secrets.toml`
+- 或者设置 `PIKO_SETTINGS_PATH=/path/to/your.toml`
 
-### 2. 如何使用动态配置
+最低必配：
 
-你不需要重启服务，只需在数据库中插入或更新以下 JSON：
+- `mysql_dsn`（必须，负责存元数据）
 
-```sql
-INSERT INTO job_config (job_id, schema_version, config_json, version, updated_at)
-VALUES (
-    'piko_system_settings',  -- ⚠️ 系统保留 ID，不可更改
-    1,
-    '{
-        "poll_interval_s": 5,       -- [调优] 将轮询间隔加速到 5秒 (默认10s)
-        "poll_jitter_s": 1,         -- [调优] 减少抖动范围
-        "log_level": "DEBUG"        -- [排查] 临时开启调试日志，查完改回 INFO
-    }',
-    1,
-    NOW()
-) 
-ON DUPLICATE KEY UPDATE 
-    config_json = VALUES(config_json), 
-    version = version + 1;
+环境变量示例：
+
+```bash
+export PIKO_MYSQL_DSN="mysql+asyncmy://user:pass@host:3306/piko?charset=utf8mb4"
+export PIKO_TIMEZONE="Asia/Shanghai"
+export PIKO_DEBUG="false"
 ```
 
-### 3. 常见误区 (Common Pitfalls)
+---
 
-- ❌ **错误做法**：在数据库里修改 `mysql_pool_size` 想扩大连接池。
-  - **后果**：无效。连接池在进程启动的第一秒就已经固定了，数据库里的配置会被忽略。
-- ❌ **错误做法**：在数据库里修改 `timezone`。
-  - **后果**：极度危险。调度器可能产生逻辑分裂（部分任务按旧时区跑，部分按新时区计算），导致任务漏跑或重跑。
-- ✅ **正确做法**：仅在数据库中调整 `poll_interval_s` (控制节奏) 和 `log_level` (控制日志量)。
+## 运维端点与可观测性
+
+Piko 内置 FastAPI 运维端点（无需你自己写）：
+
+- `GET /healthz`：存活探针（liveness）
+- `GET /readyz`：就绪探针（readiness；Follower 会是 standby）
+- `GET /metrics`：Prometheus 指标
+
+常见指标（示意）：
+
+- job 成功/失败计数：`JOB_RUN_TOTAL{job_id=..., status=...}`
+- job 耗时直方图：`JOB_DURATION_SECONDS{job_id=...}`
+- leader 状态：`LEADER_STATUS{host=...}`
+- 持久化队列长度：`PERSISTENCE_QUEUE_SIZE`
+
+---
+
+## 项目结构建议
+
+一个推荐的业务项目结构：
+
+```
+my_project/
+  app.py                # 创建 PikoApp、注册 sink、启动
+  my_project/
+    __init__.py
+    jobs.py             # 简单场景：集中放 job
+    jobs/
+      __init__.py
+      user_sync/
+        __init__.py
+        jobs.py         # 复杂场景：分目录，配合 autodiscover
+      report/
+        __init__.py
+        jobs.py
+```
+
+在 `app.py` 中：
+
+```python
+from piko import PikoApp, autodiscover
+
+app = PikoApp("my_project")
+# 自动导入所有 *.jobs.py，触发注册
+autodiscover("my_project", module_name="jobs")
+api_app = app.api_app
+```
+
+---
+
+## FAQ
+
+### 1) 我的任务里怎么拿到配置？
+
+- 给 job 声明 `schema=YourConfigModel`
+- 然后 `cfg: YourConfigModel = ctx["config"]`
+
+### 2) 如何控制并发？
+
+- I/O 并发：`asyncio.Semaphore` + `gather`
+- 生产者/消费者：`asyncio.Queue(maxsize=...)`
+- CPU 并行：`app.cpu_manager.map_reduce(..., concurrency=N)`
+
+### 3) 如何注入数据库/Redis/Mongo 等资源？
+
+用 `Resource`：
+
+- `@resource` 标记资源类
+- 在 `acquire(ctx)` 里创建连接/客户端并 `yield`
+- 在 job 的 `resources={...}` 里声明需要注入的资源

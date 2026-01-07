@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "piko-cucc"
-version = "0.1.7"
+version = "0.1.7a1"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

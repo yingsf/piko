@@ -1,5 +1,5 @@
 import inspect
-from typing import Any, Callable, Type, Awaitable, Dict, TypedDict
+from typing import Any, Callable, Type, Awaitable, Dict, TypedDict, List
 
 from pydantic import BaseModel, ValidationError
 
@@ -121,3 +121,13 @@ class JobRegistry:
         except ValidationError as e:
             logger.error("config_validation_failed", job_id=job_id, error=str(e))
             raise
+
+    def get_all_job_ids(self) -> List[str]:
+        """获取所有已注册的任务 ID 列表
+
+        用于完整性检查等场景，避免外部直接访问私有成员 _jobs
+
+        Returns:
+            List[str]: 所有已注册的 job_id 列表
+        """
+        return list(self._jobs.keys())
