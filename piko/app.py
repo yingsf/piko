@@ -346,11 +346,28 @@ class PikoApp:
         await self.startup()
 
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
-
-        logger.info("piko_running_wait_for_signal")
-        await self._shutdown_event.wait()
+        
+        # Windows 不支持信号处理器，只在支持的平台上添加
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
+            logger.info("piko_running_wait_for_signal")
+        except NotImplementedError:
+            # 在 Windows 等不支持信号处理器的平台上，使用替代方案
+            logger.info("piko_running_no_signal_handler (platform does not support signal handlers)")
+            
+            # 在这种情况下，我们使用一个持续运行的任务，但需要用户手动中断
+            # 用户可以使用 Ctrl+C 来中断程序，这将触发 KeyboardInterrupt
+            try:
+                while not self._shutdown_event.is_set():
+                    await asyncio.sleep(1)  # 每秒检查一次是否需要关闭
+            except KeyboardInterrupt:
+                logger.info("Received KeyboardInterrupt, initiating shutdown...")
+                
+        else:
+            # 在支持信号处理器的平台上等待事件
+            await self._shutdown_event.wait()
+        
         await self.shutdown()
 
     def run(self):
