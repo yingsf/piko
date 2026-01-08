@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     Boolean,
     Index,
+    text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -131,26 +132,27 @@ class ScheduledJob(Base):
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     schedule_type: Mapped[str] = mapped_column(String(16), nullable=False)
     schedule_expr: Mapped[str] = mapped_column(String(512), nullable=False)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai", nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai", server_default="Asia/Shanghai", nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
 
-    misfire_grace_s: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
-    coalesce: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    max_instances: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    jitter_s: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    misfire_grace_s: Mapped[int] = mapped_column(Integer, default=300, server_default="300", nullable=False)
+    coalesce: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
+    max_instances: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    jitter_s: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
-    executor: Mapped[str] = mapped_column(String(16), default="cpu", nullable=False)
-    concurrency_group: Mapped[str] = mapped_column(String(64), default="default", nullable=False)
+    executor: Mapped[str] = mapped_column(String(16), default="cpu", server_default="cpu", nullable=False)
+    concurrency_group: Mapped[str] = mapped_column(String(64), default="default", server_default="default", nullable=False)
 
-    is_stateful: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_stateful: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
     last_data_time: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
-    max_lookback_window: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_lookback_window: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
-    version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
+    version: Mapped[int] = mapped_column(BIGINT, default=1, server_default="1", nullable=False)
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(6),
         default=utcnow,
+        server_default=text("CURRENT_TIMESTAMP(6)"),
         onupdate=utcnow,
         nullable=False
     )
@@ -166,14 +168,15 @@ class JobConfig(Base):
     """任务配置表（支持版本化和灰度发布）"""
     __tablename__ = "job_config"
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     effective_from: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
 
-    version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
+    version: Mapped[int] = mapped_column(BIGINT, default=1, server_default="1", nullable=False)
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(6),
         default=utcnow,
+        server_default=text("CURRENT_TIMESTAMP(6)"),
         onupdate=utcnow,
         nullable=False
     )
@@ -204,7 +207,7 @@ class JobRun(Base):
     compute_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     persist_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
 
     error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -213,7 +216,7 @@ class JobRun(Base):
     host: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, server_default=text("CURRENT_TIMESTAMP(6)"), nullable=False)
 
     __table_args__ = (
         Index("idx_run_job_time", "job_id", "scheduled_time"),
@@ -229,7 +232,7 @@ class JobLock(Base):
     scheduled_time: Mapped[datetime.datetime] = mapped_column(DateTime(6), primary_key=True)
 
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
-    acquired_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
+    acquired_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, server_default=text("CURRENT_TIMESTAMP(6)"), nullable=False)
 
     __table_args__ = (
         Index("idx_lock_owner", "owner"),
@@ -242,11 +245,12 @@ class SchedulerLeader(Base):
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
     lease_until: Mapped[datetime.datetime] = mapped_column(DateTime(6), nullable=False)
-    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(6),
         default=utcnow,
+        server_default=text("CURRENT_TIMESTAMP(6)"),
         onupdate=utcnow,
         nullable=False
     )
@@ -264,10 +268,11 @@ class SinkDedupe(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(6),
         default=utcnow,
+        server_default=text("CURRENT_TIMESTAMP(6)"),
         onupdate=utcnow,
         nullable=False
     )
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, server_default=text("CURRENT_TIMESTAMP(6)"), nullable=False)
 
     __table_args__ = (
         Index("idx_dedupe_run", "run_id"),
