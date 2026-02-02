@@ -14,6 +14,7 @@
 
 - [为什么是 Piko](#为什么是-piko)
 - [核心特性](#核心特性)
+- [Watcher 机制与正确热更新方式](#watcher-机制与正确热更新方式)
 - [30 秒上手](#30-秒上手)
 - [基础概念速览](#基础概念速览)
 - [大量示例：异步 / 并发 / 异步并发](#大量示例异步--并发--异步并发)
@@ -67,6 +68,120 @@ Piko 把这些能力做成“框架默认能力”，你只需要专注写业务
 - **持久化写入引擎**：`PersistenceWriter` 队列缓冲 + 批量聚合 + 背压 + 磁盘兜底恢复
 - **内置运维 API**：`/healthz` `/readyz` `/metrics`（FastAPI + Prometheus）
 - **分布式 Leader Election**：基于 DB 租约 + CAS 乐观锁，多实例下只有 Leader 执行调度
+
+---
+
+## Watcher 机制与正确热更新方式
+
+这一节专门说明 **Piko 的热更新是如何工作的**，以及你应该如何正确更新 `job_config` / `scheduled_job`，避免“我明明改了 DB，但任务还按旧配置跑”的问题。
+
+### 1) Watcher 的本质：DB 轮询 + Reconcile（不是文件系统 watch）
+
+Piko 的 `ConfigWatcher` 不是 inotify/watchdog 那类“文件变化触发”，而是一个后台协调循环：
+
+- 周期性从 DB 读取 **期望状态**（`scheduled_job` / `job_config`）
+- 与进程内 **当前状态**（APScheduler / ConfigCache）对比
+- 把差异“收敛”回 DB 的状态（reconcile）
+
+因此热更新的延迟 ≈ `poll_interval_s ± jitter`（轮询间隔 + 抖动）。
+
+### 2) Watcher 每轮做什么（理解热更新链路）
+
+每一轮 reconcile 主要做两件事：
+
+1. **同步 job 参数（job_config → ConfigCache）**
+   - `job_config.config_json` 写入内存缓存（ConfigCache）
+   - 支持 `effective_from`：如果配置的生效时间在未来，则暂不写入缓存（灰度/延时生效）
+   - 任务真正执行时会从 ConfigCache 取 `ctx["config"]`，因此 **下一次触发执行就会使用新参数**
+
+2. **同步 job 调度（scheduled_job → APScheduler）**
+   - 对比 DB 中 enabled 的 job 列表与 APScheduler 当前 job 列表：增、删、改
+   - **重要：Piko 判断“是否需要更新触发器”的依据是 `scheduled_job.version`**
+     - watcher 会把 `version` 写进 APScheduler job 的 `name`（例如 `v1 / v2`）
+     - 只有当版本标签变化时才会 `reschedule_job(...)`
+     - 这意味着：**仅修改 `schedule_expr` 等配置，而不 bump `version`，调度不会热更新**
+
+### 3) 如何正确更新 job_config（参数热更新）
+
+#### 3.1 立即生效（推荐写法：UPSERT + version+1）
+
+```sql
+INSERT INTO job_config(job_id, schema_version, config_json, version)
+VALUES ("your_job_id", 1, '{"key":"value"}', 1)
+ON DUPLICATE KEY UPDATE
+  config_json='{"key":"value"}',
+  version = version + 1,
+  effective_from = NULL;
+```
+
+说明：
+
+- `version` 用于审计/追踪（便于定位某次运行到底用了哪个配置版本）
+- 参数热更新是否生效，通常不依赖 `version` 判断（watcher 每轮会同步 config），但**建议保持 version +1 的规范**
+- `effective_from = NULL` 表示立即生效
+
+#### 3.2 灰度/延时生效（effective_from）
+
+```sql
+UPDATE job_config
+SET config_json='{"key":"value"}',
+    effective_from = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 10 MINUTE),
+    version = version + 1
+WHERE job_id="your_job_id";
+```
+
+说明：
+
+- 在 `effective_from` 到来之前 watcher 会跳过该配置写入缓存
+- 到点后下一轮 reconcile 才会真正生效（仍受 `poll_interval_s` 影响）
+
+### 4) 如何正确更新 scheduled_job（调度热更新，必须 bump version）
+
+#### 4.1 修改调度表达式时：**一定要同时 bump version**
+
+例如把 `{"minute":"*"}` 改成每 4 小时整点（00 分）运行：
+
+```sql
+UPDATE scheduled_job
+SET
+  schedule_expr = '{"hour":"*/4","minute":"0"}',
+  version = version + 1
+WHERE job_id = "your_job_id";
+```
+
+或者用 UPSERT：
+
+```sql
+INSERT INTO scheduled_job(job_id, schedule_type, schedule_expr, enabled, version)
+VALUES ("your_job_id", "cron", '{"hour":"*/4","minute":"0"}', 1, 1)
+ON DUPLICATE KEY UPDATE
+  enabled = 1,
+  schedule_expr = '{"hour":"*/4","minute":"0"}',
+  version = version + 1;
+```
+
+✅ 重点结论（请直接当成规则记住）：
+
+- **job_config：改参数即可生效（受 effective_from / poll_interval 影响），建议 version+1 便于审计**
+- **scheduled_job：改 schedule_expr / schedule_type / timezone 等调度相关字段时，必须 version+1，否则不会 reschedule**
+
+#### 4.2 禁用/删除任务
+
+```
+-- 禁用（推荐：禁用而不是删行，便于审计）
+UPDATE scheduled_job
+SET enabled = 0, version = version + 1
+WHERE job_id = "your_job_id";
+```
+
+### 5) 常见排查 Checklist（“我改了但没生效”）
+
+- 你改的是 **正确的库/正确的环境** 吗？（容器内 DSN、配置文件）
+- 你改的是 **正确的 job_id** 吗？（避免把另一个仍每分钟的 job 当成目标 job）
+- `scheduled_job` 调度变更时，你是否 **version +1**？
+- `job_config` 是否设置了未来的 `effective_from` 导致暂未生效？
+- 你是否在多实例部署？只有 **Leader** 负责调度（Follower standby），确认你观察的是 Leader 的日志/行为
+- watcher 轮询间隔 `poll_interval_s` 是否过大？（热更新不是实时触发）
 
 ---
 
