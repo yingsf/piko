@@ -1,6 +1,7 @@
 # Piko - Data-Oriented Async Task Orchestrator
 
-[![PyPI version](https://img.shields.io/pypi/v/piko-cucc.svg)](https://pypi.org/project/piko-cucc/)
+[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.9-blue.svg)](https://pypi.org/project/piko-cucc/0.1.9/)
+[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](https://github.com/yingsf/piko/releases)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -31,7 +32,8 @@
   - [示例 11：TypedSink 类型路由（不同模型不同写法）](#示例-11typedsink-类型路由不同模型不同写法)
   - [示例 12：定时任务三种触发器（cron/interval/date）](#示例-12定时任务三种触发器cronintervaldate)
   - [示例 13：动态配置热更新（灰度生效 effective_from）](#示例-13动态配置热更新灰度生效-effective_from)
-  - [示例 14：多实例部署（Leader Election）](#示例-14多实例部署leader-election)
+- [示例 14：多实例部署（Leader Election）](#示例-14多实例部署leader-election)
+- [数据库迁移](#数据库迁移)
 - [配置](#配置)
 - [运维端点与可观测性](#运维端点与可观测性)
 - [项目结构建议](#项目结构建议)
@@ -199,7 +201,7 @@ uv pip install piko-cucc
 ### 2) 配置 MySQL DSN
 
 ```bash
-export PIKO_MYSQL_DSN="mysql+asyncmy://user:pass@127.0.0.1:3306/piko?charset=utf8mb4"
+export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@127.0.0.1:3306/piko?charset=utf8mb4"
 ```
 
 > 也可以写到 `settings.toml / piko.toml`，或用 `PIKO_SETTINGS_PATH` 指向自定义配置文件。
@@ -558,16 +560,16 @@ Resource 的本质：**一个异步上下文管理器工厂**。 Piko 在每次 
 ### 8.1 定义一个 Resource（例如 HTTP Client）
 
 ```python
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 import httpx
 from piko.core.resource import resource
 
-@resource
-class HttpClientResource:
-    @asynccontextmanager
-    async def acquire(self, ctx):
-        async with httpx.AsyncClient(timeout=10) as client:
-            yield client
+@resource(name="http_client")
+@asynccontextmanager
+async def http_client(ctx: dict[str, object]) -> AsyncGenerator[httpx.AsyncClient, None]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        yield client
 ```
 
 ### 8.2 在 job 里声明并注入
@@ -581,10 +583,10 @@ api_app = app.api_app
 
 @app.job(
     job_id="fetch_with_resource",
-    resources={"client": HttpClientResource},
+    resources={"client": http_client},
 )
 async def fetch_with_resource(ctx, scheduled_time, client):
-    # client 是被注入的 httpx.AsyncClient
+    # client 是被注入的 HTTP 客户端
     urls = ["https://example.com"] * 100
     sem = asyncio.Semaphore(50)
 
@@ -609,18 +611,15 @@ async def fetch_with_resource(ctx, scheduled_time, client):
 from contextlib import asynccontextmanager
 from piko.core.resource import resource
 
-@resource
-class RedisResource:
-    @asynccontextmanager
-    async def acquire(self, ctx):
-        # 这里用伪代码示意
-        # import redis.asyncio as redis
-        # client = redis.Redis.from_url("redis://127.0.0.1:6379/0")
-        # try:
-        #     yield client
-        # finally:
-        #     await client.close()
-        yield object()
+@resource(name="redis")
+@asynccontextmanager
+async def redis(ctx: dict[str, object]):
+    # 在这里创建客户端，并在 finally 中释放连接
+    client = create_redis_client("redis://127.0.0.1:6379/0")
+    try:
+        yield client
+    finally:
+        await client.close()
 ```
 
 ### 9.2 注入 Mongo / ES / MQ / 任何你自己的 Client
@@ -837,13 +836,39 @@ leader_renew_interval_s = 10
 
 ---
 
+## 数据库迁移
+
+Piko 启动时只校验 schema 版本，不会自动执行 DDL。首次部署或升级时，在发布步骤中单独运行迁移：
+
+```bash
+export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@host:3306/piko?charset=utf8mb4"
+uv run python scripts/migrate.py upgrade
+```
+
+迁移入口使用 MySQL advisory lock，同一数据库同时只有一个副本执行 Alembic。发布前可生成离线 SQL：
+
+```bash
+uv run alembic upgrade head --sql > /tmp/piko-upgrade.sql
+```
+
+降级只用于已验证的回滚窗口，并应先备份数据库：
+
+```bash
+uv run python scripts/migrate.py downgrade -1
+```
+
+---
+
 ## 配置
 
 Piko 使用 Dynaconf，默认读取：
 
-- `defaults.toml`（库内置）
-- `settings.toml` / `piko.toml` / `.secrets.toml`
-- 或者设置 `PIKO_SETTINGS_PATH=/path/to/your.toml`
+- 包内只读 defaults
+- `PIKO_CONFIG_DIR=/etc/piko` 指向目录中的 `piko.toml`
+- `PIKO_SETTINGS_PATH=/etc/piko/piko.toml` 指向单个显式文件
+- `PIKO_*` 环境变量（优先级最高）
+
+默认不读取当前工作目录的 TOML 或 `.env`。迁移旧部署时可显式设置 `PIKO_ENABLE_CWD_CONFIG=true`，但该兼容层应尽快移除。显式文件或目录不存在、不可读时启动直接失败；日志只记录来源和覆盖键名，不记录 DSN、密码或 token。
 
 最低必配：
 
@@ -852,10 +877,38 @@ Piko 使用 Dynaconf，默认读取：
 环境变量示例：
 
 ```bash
-export PIKO_MYSQL_DSN="mysql+asyncmy://user:pass@host:3306/piko?charset=utf8mb4"
+export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@host:3306/piko?charset=utf8mb4"
 export PIKO_TIMEZONE="Asia/Shanghai"
 export PIKO_DEBUG="false"
 ```
+
+### 配置契约
+
+除 `piko_system_settings.poll_interval_s` 外，以下配置均在组件创建或启动时读取，修改后需要重启；`PIKO_*` 是对应环境变量名。`mysql_dsn` 是唯一必填项。
+
+| 配置 | 类型 / 默认值 | 环境变量 | 生效域与时机 | 敏感 |
+| --- | --- | --- | --- | --- |
+| `mysql_dsn` | URL / 必填 | `PIKO_MYSQL_DSN` | 启动静态，建连接池 | 是 |
+| `mysql_pool_size`, `mysql_max_overflow`, `mysql_pool_recycle_s` | int / `20`, `10`, `3600` | `PIKO_MYSQL_*` | 启动静态 | 否 |
+| `timezone` | string / `Asia/Shanghai` | `PIKO_TIMEZONE` | 启动静态，Scheduler | 否 |
+| `poll_interval_s`, `poll_jitter_s` | number / `10`, `2` | `PIKO_POLL_*` | `poll_interval_s` 可由 DB 动态覆盖；`poll_jitter_s` 重启生效 | 否 |
+| `ap_misfire_grace_s_default`, `ap_max_instances_default` | int / `300`, `1` | `PIKO_AP_*` | 启动静态，Scheduler 默认值 | 否 |
+| `leader_enabled`, `leader_name`, `leader_lease_s`, `leader_renew_interval_s` | bool/string/int / `true`, `default`, `30`, `10` | `PIKO_LEADER_*` | 启动静态，Leader | 否 |
+| `leader_watchdog_jitter_s`, `leader_db_failure_grace_s` | number / `1`, `5` | `PIKO_LEADER_*` | Watchdog 运行参数 | 否 |
+| `cpu_workers`, `per_job_cpu_max` | int / `0`, `8` | `PIKO_CPU_*`, `PIKO_PER_JOB_CPU_MAX` | 启动静态，CpuManager | 否 |
+| `job_lock_lease_s`, `job_lock_heartbeat_s`, `job_run_orphan_timeout_s` | int / `300`, `30`, `900` | `PIKO_JOB_*` | Runner 运行参数 | 否 |
+| `job_handler_timeout_s`, `shutdown_timeout_s` | int / `300`, `30` | `PIKO_JOB_HANDLER_TIMEOUT_S`, `PIKO_SHUTDOWN_TIMEOUT_S` | Runner / 应用停机预算 | 否 |
+| `persist_queue_max`, `persist_batch_size`, `persist_batch_timeout_s`, `persist_flush_timeout_s`, `persist_disk_fallback_path` | int/number/path / `200`, `100`, `0.5`, `60`, `/tmp/piko_fallback.bin` | `PIKO_PERSIST_*` | Writer 创建或停机时读取 | 路径视部署而定 |
+| `metrics_enabled`, `api_docs_enabled` | bool / `true`, `false` | `PIKO_METRICS_ENABLED`, `PIKO_API_DOCS_ENABLED` | API 路由创建或请求时 | 否 |
+| `debug`, `log_level`, `log_json` | bool/string/bool / `false`, `INFO`, `false` | `PIKO_DEBUG`, `PIKO_LOG_*` | 启动静态，日志初始化 | 否 |
+
+系统级 DB 动态配置只接受下面这一项，其他字段写入 `piko_system_settings` 不会生效：
+
+```json
+{"poll_interval_s": 15}
+```
+
+有效范围是 `1` 到 `3600` 秒；非法值会保留上一次有效间隔并记录告警。任务级参数仍写入对应 `job_config`，调度字段仍写入 `scheduled_job`。
 
 ---
 
@@ -866,6 +919,8 @@ Piko 内置 FastAPI 运维端点（无需你自己写）：
 - `GET /healthz`：存活探针（liveness）
 - `GET /readyz`：就绪探针（readiness；Follower 会是 standby）
 - `GET /metrics`：Prometheus 指标
+
+这些端点只应绑定在私网/监控网段，或放在已有认证反向代理和 NetworkPolicy 后面；Piko 不提供默认的 HTTP 认证。生产默认关闭 `/docs`、`/redoc` 和 `/openapi.json`，仅在 `api_docs_enabled = true` 且访问边界受控时临时开启。`/readyz` 会在数据库、Writer、Watcher、Scheduler 或 Leader 未就绪时返回 HTTP 503。
 
 常见指标（示意）：
 
@@ -926,6 +981,6 @@ api_app = app.api_app
 
 用 `Resource`：
 
-- `@resource` 标记资源类
-- 在 `acquire(ctx)` 里创建连接/客户端并 `yield`
-- 在 job 的 `resources={...}` 里声明需要注入的资源
+- 用 `@resource(name=...)` 包装一个 `@asynccontextmanager` 函数
+- 在资源函数中创建连接/客户端并 `yield`
+- 在 job 的 `resources={...}` 中声明资源类

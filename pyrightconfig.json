@@ -1,0 +1,7 @@
+{
+  "include": ["piko", "tests", "scripts"],
+  "exclude": [".venv", "build", "dist"],
+  "stubPath": "typings",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict"
+}

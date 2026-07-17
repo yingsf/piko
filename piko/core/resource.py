@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+
+JobContext = dict[str, object]
+ResourceFactory = Callable[[JobContext], AbstractAsyncContextManager[object]]
 
 
 class Resource(ABC):
@@ -35,7 +39,7 @@ class Resource(ABC):
     __resource_name__: str | None = None
 
     @abstractmethod
-    def acquire(self, ctx: dict) -> Any:
+    def acquire(self, ctx: JobContext) -> AbstractAsyncContextManager[object]:
         """获取资源的异步上下文管理器
 
         本方法是资源协议的核心，定义了如何获取和释放外部资源。必须返回一个实现了 `__aenter__` 和 `__aexit__` 的异步上下文管理器
@@ -135,7 +139,7 @@ class SimpleResource(Resource):
         通常不直接使用此类，而是通过 `@resource` 装饰器间接使用
     """
 
-    def __init__(self, func):
+    def __init__(self, func: ResourceFactory) -> None:
         """初始化 SimpleResource
 
         Args:
@@ -145,7 +149,7 @@ class SimpleResource(Resource):
         # 不在此处调用函数，而是延迟到 acquire 调用时，这样可以在 Runner 调用时传入最新的 ctx
         self._func = func
 
-    def acquire(self, ctx: dict) -> Any:
+    def acquire(self, ctx: JobContext) -> AbstractAsyncContextManager[object]:
         """调用被包装的函数以获取资源
 
         Args:
@@ -160,7 +164,7 @@ class SimpleResource(Resource):
         return self._func(ctx)
 
 
-def resource(name: str | None = None):
+def resource(name: str | None = None) -> Callable[[ResourceFactory], type[Resource]]:
     """装饰器：将函数转换为 Resource 类（装饰器工厂模式）
 
     本装饰器提供了一种声明式的方式来定义资源，无需手动继承 Resource 类。它在内部创建一个 SimpleResource 的子类，并将函数包装其中
@@ -202,7 +206,7 @@ def resource(name: str | None = None):
         - `name` 参数存储在类的 `__resource_name__` 属性中，可用于日志输出
     """
 
-    def wrapper(func):
+    def wrapper(func: ResourceFactory) -> type[Resource]:
         """真正地装饰器函数
 
         Args:
@@ -214,7 +218,6 @@ def resource(name: str | None = None):
         Note:
             使用类而非实例的原因：
                 - Registry 存储的是类（Type[Resource]），在每次任务执行时才实例化
-                - 这样可以在实例化时传入不同的参数（虽然当前版本未使用）
                 - 符合"依赖注入容器"的常见设计模式（类作为"蓝图"，容器负责创建实例）
         """
 
@@ -224,7 +227,7 @@ def resource(name: str | None = None):
         class _Wrapped(SimpleResource):
             __resource_name__ = name
 
-            def __init__(self):
+            def __init__(self) -> None:
                 """初始化包装后的资源类
 
                 调用父类的 __init__，将被装饰的函数传递给 SimpleResource

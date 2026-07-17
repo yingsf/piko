@@ -1,0 +1,21 @@
+name: Quality
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --all-groups --locked
+      - run: uv lock --check
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+      - run: uv run pytest
+      - run: uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file /tmp/piko-requirements.txt
+      - run: uv run pip-audit --strict --disable-pip -r /tmp/piko-requirements.txt

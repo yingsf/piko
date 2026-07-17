@@ -1,15 +1,19 @@
 import datetime
+from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
 from sqlalchemy import (
     BIGINT,
     JSON,
     String,
-    DateTime,
     Integer,
     Boolean,
     Index,
+    UniqueConstraint,
+    text,
 )
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     create_async_engine,
@@ -23,6 +27,38 @@ from piko.config import settings
 from piko.infra.logging import get_logger
 
 logger = get_logger(__name__)
+CURRENT_SCHEMA_REVISION = "0005_remove_sink_dedupe"
+
+
+def normalize_mysql_dsn(dsn: str) -> URL:
+    """将 MySQL 异步 DSN 解析为 aiomysql URL
+
+    项目接受 ``mysql+asyncmy`` 作为配置别名，实际连接统一使用 aiomysql
+    驱动，以保持已有部署变量可用并统一异步 MySQL 驱动边界。
+
+    Args:
+        dsn: 配置中的 SQLAlchemy 数据库 URL。
+
+    Returns:
+        已解析的 SQLAlchemy URL。
+
+    Raises:
+        ValueError: 当 DSN 不是支持的异步 MySQL 驱动时。
+    """
+    url = make_url(dsn)
+    if url.drivername == "mysql+asyncmy":
+        logger.warning(
+            "deprecated_mysql_driver_alias",
+            configured_driver="asyncmy",
+            effective_driver="aiomysql",
+        )
+        return url.set(drivername="mysql+aiomysql")
+    if url.drivername != "mysql+aiomysql":
+        raise ValueError(
+            "mysql_dsn must use the async mysql driver "
+            "mysql+aiomysql:// (mysql+asyncmy:// is accepted as a compatibility alias)."
+        )
+    return url
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -32,6 +68,7 @@ class Base(AsyncAttrs, DeclarativeBase):
     - 异步属性加载能力（AsyncAttrs）
     - 声明式映射支持（DeclarativeBase）
     """
+
     pass
 
 
@@ -61,18 +98,14 @@ def init_db() -> None:
         )
 
     _engine = create_async_engine(
-        settings.mysql_dsn,
+        normalize_mysql_dsn(str(settings.mysql_dsn)),
         pool_size=settings.mysql_pool_size,
         max_overflow=settings.mysql_max_overflow,
         pool_recycle=settings.mysql_pool_recycle_s,
         echo=settings.debug,
-        pool_pre_ping=True
+        pool_pre_ping=True,
     )
-    _session_maker = async_sessionmaker(
-        bind=_engine,
-        expire_on_commit=False,
-        autoflush=False
-    )
+    _session_maker = async_sessionmaker(bind=_engine, expire_on_commit=False, autoflush=False)
 
 
 async def reset_db() -> None:
@@ -94,11 +127,20 @@ async def reset_db() -> None:
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """获取数据库会话的异步生成器（依赖注入模式）
+    """兼容旧依赖注入调用的数据库会话生成器。
+
+    新代码应使用 :func:`get_session_context`，避免把单次会话误用为迭代器。
 
     Yields:
         AsyncSession: 已绑定引擎的会话对象
     """
+    async with get_session_context() as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_session_context() -> AsyncGenerator[AsyncSession, None]:
+    """以异步上下文管理器提供一个数据库会话。"""
     if _session_maker is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
 
@@ -107,12 +149,53 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def create_all_tables() -> None:
-    """创建所有已定义的数据库表"""
+    """创建所有已定义的数据库表
+
+    此函数只供隔离测试准备临时数据库使用。生产环境必须通过 Alembic
+    迁移入口管理 schema，应用启动不会自动执行 DDL。
+    """
     if _engine is None:
         raise RuntimeError("Database not initialized.")
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def verify_schema() -> None:
+    """验证数据库已应用当前迁移版本
+
+    Raises:
+        RuntimeError: 当迁移版本缺失、过旧或数据库尚未初始化时。
+    """
+    if _engine is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+
+    async with _engine.connect() as connection:
+        try:
+            result = await connection.execute(text("SELECT version_num FROM alembic_version"))
+        except Exception as error:
+            raise RuntimeError(
+                "Database schema is not initialized; run 'python scripts/migrate.py' first."
+            ) from error
+        revision = result.scalar_one_or_none()
+    if revision != CURRENT_SCHEMA_REVISION:
+        raise RuntimeError(
+            f"Database schema revision {revision!r} does not match "
+            f"application revision {CURRENT_SCHEMA_REVISION!r}."
+        )
+
+
+async def check_database_connection() -> bool:
+    """执行轻量查询检查数据库连接是否可用。"""
+    if _engine is None:
+        return False
+    try:
+        async with _engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        return True
+    except Exception as error:
+        logger.warning("database_health_check_failed", error=str(error))
+        return False
 
 
 def utcnow() -> datetime.datetime:
@@ -124,8 +207,10 @@ def utcnow() -> datetime.datetime:
 # Piko 核心模型定义
 # =============================================================================
 
+
 class ScheduledJob(Base):
     """计划任务调度配置表"""
+
     __tablename__ = "scheduled_job"
 
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -133,6 +218,7 @@ class ScheduledJob(Base):
     schedule_expr: Mapped[str] = mapped_column(String(512), nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
     misfire_grace_s: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
     coalesce: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -143,16 +229,13 @@ class ScheduledJob(Base):
     concurrency_group: Mapped[str] = mapped_column(String(64), default="default", nullable=False)
 
     is_stateful: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    last_data_time: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
+    last_data_time: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
     max_lookback_window: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(6),
-        default=utcnow,
-        onupdate=utcnow,
-        nullable=False
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
     )
 
     __table_args__ = (
@@ -164,18 +247,16 @@ class ScheduledJob(Base):
 
 class JobConfig(Base):
     """任务配置表（支持版本化和灰度发布）"""
+
     __tablename__ = "job_config"
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    effective_from: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
+    effective_from: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
     version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(6),
-        default=utcnow,
-        onupdate=utcnow,
-        nullable=False
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
     )
 
     __table_args__ = (
@@ -186,20 +267,23 @@ class JobConfig(Base):
 
 class JobRun(Base):
     """任务执行记录表"""
+
     __tablename__ = "job_run"
     run_id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
-    scheduled_time: Mapped[datetime.datetime] = mapped_column(DateTime(6), nullable=False)
-    start_time: Mapped[datetime.datetime] = mapped_column(DateTime(6), nullable=False)
-    end_time: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
+    scheduled_time: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    start_time: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    end_time: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     config_version: Mapped[int | None] = mapped_column(BIGINT, nullable=True)
     schedule_version: Mapped[int | None] = mapped_column(BIGINT, nullable=True)
 
-    data_time_start: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
-    data_time_end: Mapped[datetime.datetime | None] = mapped_column(DateTime(6), nullable=True)
+    data_time_start: Mapped[datetime.datetime | None] = mapped_column(
+        DATETIME(fsp=6), nullable=True
+    )
+    data_time_end: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
     compute_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     persist_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -213,64 +297,44 @@ class JobRun(Base):
     host: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
+    )
 
     __table_args__ = (
         Index("idx_run_job_time", "job_id", "scheduled_time"),
         Index("idx_run_status", "status"),
         Index("idx_run_created", "created_at"),
+        UniqueConstraint("job_id", "scheduled_time", "attempt", name="uq_run_job_time_attempt"),
     )
 
 
 class JobLock(Base):
     """任务执行锁表（防止重复执行）"""
+
     __tablename__ = "job_lock"
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    scheduled_time: Mapped[datetime.datetime] = mapped_column(DateTime(6), primary_key=True)
+    scheduled_time: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), primary_key=True)
 
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
-    acquired_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
-
-    __table_args__ = (
-        Index("idx_lock_owner", "owner"),
+    owner_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    acquired_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
     )
+    expires_at: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+    __table_args__ = (Index("idx_lock_owner", "owner"),)
 
 
 class SchedulerLeader(Base):
     """调度器 Leader 选举表"""
+
     __tablename__ = "scheduler_leader"
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
-    lease_until: Mapped[datetime.datetime] = mapped_column(DateTime(6), nullable=False)
+    lease_until: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(6),
-        default=utcnow,
-        onupdate=utcnow,
-        nullable=False
-    )
-
-
-class SinkDedupe(Base):
-    """数据输出去重表（幂等性保证）"""
-    __tablename__ = "sink_dedupe"
-    sink_name: Mapped[str] = mapped_column(String(64), primary_key=True)
-    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
-
-    run_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
-
-    updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(6),
-        default=utcnow,
-        onupdate=utcnow,
-        nullable=False
-    )
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(6), default=utcnow, nullable=False)
-
-    __table_args__ = (
-        Index("idx_dedupe_run", "run_id"),
-        Index("idx_dedupe_status_updated", "status", "updated_at"),
-        Index("idx_dedupe_created", "created_at"),
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
     )

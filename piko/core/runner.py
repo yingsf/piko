@@ -3,21 +3,23 @@ import datetime
 import json
 import os
 import socket
+import uuid
 from contextlib import AsyncExitStack
-from typing import Optional, List, cast, Tuple, Dict, Any
+from typing import Any, cast
 
 from croniter import croniter
 from sqlalchemy import delete
-from sqlalchemy import insert, update, select, CursorResult
+from sqlalchemy import CursorResult, exists, func, insert, or_, update, select
 from sqlalchemy.exc import IntegrityError
 
 from piko.config import settings
 from piko.core.cache import ConfigCache
-from piko.core.registry import JobRegistry, JobOptions
+from piko.core.registry import JobHandler, JobRegistry, JobOptions
+from piko.core.resource import Resource
 from piko.core.types import DataInterval, BackfillPolicy
-from piko.infra.db import get_session, JobLock, JobRun, ScheduledJob, utcnow
+from piko.infra.db import get_session_context, JobLock, JobRun, ScheduledJob, utcnow
 from piko.infra.leader import get_leader_mutex
-from piko.infra.logging import get_logger
+from piko.infra.logging import LazyLoggerProxy, get_logger
 from piko.infra.observability import JOB_RUN_TOTAL, JOB_DURATION_SECONDS
 from piko.persistence.writer import PersistenceWriter
 
@@ -39,7 +41,7 @@ class JobRunner:
            b. 创建执行记录（job_run 表）
            c. 实例化并注入资源（AsyncExitStack 管理生命周期）
            d. 调用任务处理函数（传入 ctx、scheduled_time 和注入的资源）
-           e. 刷新持久化缓冲区（persistence_writer）
+           e. 刷新持久化缓冲区（Writer）
            f. 更新执行记录（状态、耗时、错误信息）
            g. 记录 Prometheus 指标
            h. 释放资源（AsyncExitStack 自动清理）
@@ -68,11 +70,8 @@ class JobRunner:
     """
 
     def __init__(
-            self,
-            registry: JobRegistry,
-            config_cache: ConfigCache,
-            writer: PersistenceWriter
-    ):
+        self, registry: JobRegistry, config_cache: ConfigCache, writer: PersistenceWriter
+    ) -> None:
         """初始化任务执行引擎
 
         Args:
@@ -82,13 +81,17 @@ class JobRunner:
         """
         # 构建主机标识符：hostname:pid
         self.host_id = f"{socket.gethostname()}:{os.getpid()}"
+        self.owner_token = uuid.uuid4().hex
 
         # 依赖注入
         self.registry = registry
         self.config_cache = config_cache
         self.writer = writer
+        self.handler_timeout_s = float(getattr(settings, "job_handler_timeout_s", 300))
+        if self.handler_timeout_s <= 0:
+            raise ValueError("job_handler_timeout_s must be greater than zero")
 
-    async def run_job(self, job_id: str, scheduled_time: datetime.datetime | None = None):
+    async def run_job(self, job_id: str, scheduled_time: datetime.datetime | None = None) -> None:
         """任务执行的核心入口（支持有状态回填 + 资源注入）
 
         本方法是 APScheduler 触发任务的入口，负责整个任务的生命周期管理
@@ -158,18 +161,18 @@ class JobRunner:
                 logic_scheduled_time,
                 # 无状态任务不传递时间窗口
                 interval if is_stateful else None,
-                opts["resources"]
+                opts["resources"],
             )
 
-            # 4. 后处理：更新水位线或中断回填
+            # 4. 后处理：失败时中断回填
             if is_stateful:
-                if success:
-                    await self._update_watermark(job_id, interval.end)
-                else:
+                if not success:
                     log.warning("backfill_interrupted_by_failure", failed_interval=str(interval))
                     break
 
-    def _validate_and_get_handler(self, job_id: str, log) -> Optional[Tuple[Any, JobOptions]]:
+    def _validate_and_get_handler(
+        self, job_id: str, log: LazyLoggerProxy
+    ) -> tuple[JobHandler, JobOptions] | None:
         """前置校验：检查运行条件并获取任务处理函数
 
         Args:
@@ -203,12 +206,12 @@ class JobRunner:
         return handler, opts
 
     async def _resolve_intervals(
-            self,
-            job_id: str,
-            scheduled_time: datetime.datetime,
-            opts: JobOptions,
-            log
-    ) -> List[DataInterval]:
+        self,
+        job_id: str,
+        scheduled_time: datetime.datetime,
+        opts: JobOptions,
+        log: LazyLoggerProxy,
+    ) -> list[DataInterval]:
         """计算需要执行的时间窗口列表
 
         Args:
@@ -237,15 +240,16 @@ class JobRunner:
             log.info("stateful_job_no_interval_needed")
             return []
 
-        log.info("stateful_job_backfill_plan", count=len(intervals), intervals=[str(i) for i in intervals])
+        log.info(
+            "stateful_job_backfill_plan",
+            count=len(intervals),
+            intervals=[str(i) for i in intervals],
+        )
         return intervals
 
     async def _calculate_backfill_intervals(
-            self,
-            job_id: str,
-            trigger_time: datetime.datetime,
-            policy: BackfillPolicy
-    ) -> List[DataInterval]:
+        self, job_id: str, trigger_time: datetime.datetime, policy: BackfillPolicy
+    ) -> list[DataInterval]:
         """计算有状态任务需要补跑的时间窗口列表（回填算法核心）
 
         Args:
@@ -298,8 +302,6 @@ class JobRunner:
         if last_data_time is None:
             cron_iter = croniter(cron_expr, trigger_time)
             prev_time = cron_iter.get_prev(datetime.datetime)
-            # 更新数据库中的水位线（避免下次再初始化）
-            await self._update_watermark(job_id, prev_time)
             last_data_time = prev_time
 
         # 根据补跑策略计算回填区间
@@ -315,7 +317,7 @@ class JobRunner:
                 return []
 
         # 追赶模式（CATCH_UP）：补齐所有漏跑的周期
-        intervals = []
+        intervals: list[DataInterval] = []
         # 当前的水位线（起始点）
         current_head = last_data_time
         cron_iter = croniter(cron_expr, current_head)
@@ -343,11 +345,11 @@ class JobRunner:
         return intervals
 
     async def _execute_single_run(
-            self,
-            job_id: str,
-            scheduled_time: datetime.datetime,
-            data_interval: Optional[DataInterval],
-            resource_defs: Dict[str, Any]  # [新增 v0.3]
+        self,
+        job_id: str,
+        scheduled_time: datetime.datetime,
+        data_interval: DataInterval | None,
+        resource_defs: dict[str, type[Resource]],
     ) -> bool:
         """执行单次任务逻辑
 
@@ -378,7 +380,7 @@ class JobRunner:
                c. 入栈（enter），获取资源实例
                d. 将资源实例添加到 injected_kwargs 中
             5. 调用任务处理函数（传入 ctx、scheduled_time 和注入的资源）
-            6. 刷新持久化缓冲区（persistence_writer.flush）
+            6. 刷新持久化缓冲区（Writer.flush）
             7. 更新执行记录（状态、耗时、错误信息）
             8. 记录 Prometheus 指标
             9. 释放资源（AsyncExitStack 自动清理）
@@ -386,6 +388,10 @@ class JobRunner:
         # 从缓存获取配置，使用注入的 config_cache 实例
         cached_conf = self.config_cache.get(job_id)
         config_version = cached_conf.version if cached_conf else None
+
+        if settings.leader_enabled and not await get_leader_mutex().verify_fencing_token():
+            logger.warning("runner_skip_invalid_leader_fencing", job_id=job_id)
+            return False
 
         # 尝试获取幂等锁
         if not await self._acquire_lock(job_id, scheduled_time):
@@ -399,14 +405,17 @@ class JobRunner:
         )
         if not run_id:
             # 执行记录创建失败，跳过执行
+            await self._release_lock(job_id, scheduled_time)
             return False
+
+        heartbeat_task = asyncio.create_task(self._heartbeat_lock(job_id, scheduled_time))
 
         # 构建任务上下文（ctx）
         # 设计考量：ctx 是字典，包含任务执行所需的所有元数据
-        ctx: Dict[str, Any] = {
+        ctx: dict[str, object] = {
             "run_id": run_id,
             "job_id": job_id,
-            "config": cached_conf.config_json if cached_conf else {}
+            "config": cached_conf.config_json if cached_conf else {},
         }
         # 如果是有状态任务，添加 data_interval 到上下文
         if data_interval:
@@ -431,14 +440,17 @@ class JobRunner:
                 if not handler:
                     raise ValueError(f"Job {job_id} handler missing")
 
-                # 如果有配置，使用 Pydantic 验证配置数据
-                if cached_conf:
-                    # 使用注入的 registry 实例进行校验
-                    typed_config = self.registry.validate_config(job_id, cached_conf.config_json)
-                    ctx["config"] = typed_config
+                if settings.leader_enabled and not await get_leader_mutex().verify_fencing_token():
+                    raise RuntimeError("Leader fencing token is no longer valid")
+
+                # 无论缓存是否命中，都通过 Registry 验证配置；缺失配置按空对象处理，
+                # 这样有必填字段的 Schema 会明确失败，有默认值的 Schema 仍能生效。
+                config_data = cached_conf.config_json if cached_conf else {}
+                typed_config = self.registry.validate_config(job_id, config_data)
+                ctx["config"] = typed_config
 
                 # 遍历资源定义字典，逐个实例化并注入资源
-                injected_kwargs = {}
+                injected_kwargs: dict[str, object] = {}
                 for arg_name, res_cls in resource_defs.items():
                     try:
                         # 1. 实例化资源工厂（Resource 类）
@@ -460,7 +472,10 @@ class JobRunner:
                         raise RuntimeError(f"Failed to inject resource '{arg_name}': {e}") from e
 
                 # 调用任务处理函数，传入 ctx、scheduled_time 和所有注入的资源
-                await handler(ctx, scheduled_time, **injected_kwargs)
+                await asyncio.wait_for(
+                    handler(ctx, scheduled_time, **injected_kwargs),
+                    timeout=self.handler_timeout_s,
+                )
 
                 # 刷新持久化缓冲区，使用注入的 writer 实例
                 await self.writer.flush()
@@ -475,35 +490,37 @@ class JobRunner:
                 log.error("job_failed", error=error_msg, exc_info=True)
 
             finally:
-                # 释放幂等锁
-                try:
-                    stmt = delete(JobLock).where(
-                        JobLock.job_id == job_id,
-                        JobLock.scheduled_time == scheduled_time
-                    )
-                    async for session in get_session():
-                        await session.execute(stmt)
-                        await session.commit()
-                except Exception as e:
-                    log.error("release_lock_failed", error=str(e))
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
 
                 # 计算执行耗时（毫秒）
                 end_ts = asyncio.get_running_loop().time()
                 duration_ms = int((end_ts - start_ts) * 1000)
 
+                try:
+                    await self._finish_run_record(
+                        run_id,
+                        job_id,
+                        status,
+                        duration_ms,
+                        error_type,
+                        error_msg,
+                        data_interval.end if status == "SUCCESS" and data_interval else None,
+                    )
+                except Exception as e:
+                    log.critical("runner_finish_record_failed", error=str(e))
+                    status = "FAILED"
+
                 # 记录 Prometheus 指标
                 JOB_RUN_TOTAL.labels(job_id=job_id, status=status).inc()
                 JOB_DURATION_SECONDS.labels(job_id=job_id).observe(end_ts - start_ts)
 
-                # 更新执行记录（job_run 表）
-                try:
-                    await self._finish_run_record(run_id, status, duration_ms, error_type, error_msg)
-                except Exception as e:
-                    log.critical("runner_finish_record_failed", error=str(e))
+                # 释放幂等锁
+                await self._release_lock(job_id, scheduled_time, log)
 
         return status == "SUCCESS"
 
-    async def _get_job_state(self, job_id: str) -> Optional[ScheduledJob]:
+    async def _get_job_state(self, job_id: str) -> ScheduledJob | None:
         """从数据库获取任务的状态信息
 
         Args:
@@ -517,30 +534,10 @@ class JobRunner:
             - scalar_one_or_none() 确保查询结果最多一条（如果有多条会抛出异常）
         """
         stmt = select(ScheduledJob).where(ScheduledJob.job_id == job_id)
-        async for session in get_session():
+        async with get_session_context() as session:
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
         return None
-
-    async def _update_watermark(self, job_id: str, new_watermark: datetime.datetime):
-        """更新任务的数据水位线（last_data_time）
-
-        Args:
-            job_id (str): 任务的唯一标识符
-            new_watermark (datetime.datetime): 新的水位线时间
-
-        Note:
-            - 水位线表示任务已成功处理到的数据截止时间
-            - 更新后立即提交事务（commit），确保水位线持久化
-        """
-        stmt = (
-            update(ScheduledJob)
-            .where(ScheduledJob.job_id == job_id)
-            .values(last_data_time=new_watermark)
-        )
-        async for session in get_session():
-            await session.execute(stmt)
-            await session.commit()
 
     async def _acquire_lock(self, job_id: str, scheduled_time: datetime.datetime) -> bool:
         """尝试获取幂等锁（分布式锁）
@@ -554,36 +551,168 @@ class JobRunner:
 
         设计原理：
             - 锁键为 (job_id, scheduled_time)，利用数据库的唯一索引实现分布式锁
-            - 如果插入成功，说明锁获取成功；如果插入失败（IntegrityError），说明锁已存在
-            - 锁无超时机制（假设任务最终会完成或被强制终止）
+            - 过期锁通过条件更新回收，当前 Worker 使用 owner_token 续租和释放
 
         Note:
             - IntegrityError 是预期的异常（锁已存在），不应记录错误日志
             - 其他异常（如数据库连接失败）返回 False，避免任务重复执行
         """
-        stmt = insert(JobLock).values(
+        now = utcnow()
+        expires_at = now + datetime.timedelta(seconds=settings.job_lock_lease_s)
+        update_stmt = (
+            update(JobLock)
+            .where(
+                JobLock.job_id == job_id,
+                JobLock.scheduled_time == scheduled_time,
+                JobLock.expires_at <= now,
+            )
+            .values(
+                owner=self.host_id,
+                owner_token=self.owner_token,
+                acquired_at=now,
+                expires_at=expires_at,
+            )
+        )
+        insert_stmt = insert(JobLock).values(
             job_id=job_id,
             scheduled_time=scheduled_time,
             owner=self.host_id,
-            acquired_at=utcnow()
+            owner_token=self.owner_token,
+            acquired_at=now,
+            expires_at=expires_at,
         )
         try:
-            async for session in get_session():
+            async with get_session_context() as session:
+                completed = await session.execute(
+                    select(JobRun.run_id)
+                    .where(
+                        JobRun.job_id == job_id,
+                        JobRun.scheduled_time == scheduled_time,
+                        JobRun.status == "SUCCESS",
+                    )
+                    .limit(1)
+                )
+                if completed.scalar_one_or_none() is not None:
+                    await session.rollback()
+                    return False
+                updated = cast(CursorResult[Any], await session.execute(update_stmt))
+                if updated.rowcount == 1:
+                    await session.commit()
+                    return True
+                try:
+                    await session.execute(insert_stmt)
+                    await session.commit()
+                    return True
+                except IntegrityError:
+                    await session.rollback()
+                    return False
+        except Exception as error:
+            logger.warning("job_lock_acquire_error", job_id=job_id, error=str(error))
+            return False
+        return False
+
+    async def _heartbeat_lock(self, job_id: str, scheduled_time: datetime.datetime) -> None:
+        """按固定间隔续租任务锁"""
+        interval = max(1, min(settings.job_lock_heartbeat_s, settings.job_lock_lease_s // 2))
+        while True:
+            await asyncio.sleep(interval)
+            now = utcnow()
+            expires_at = now + datetime.timedelta(seconds=settings.job_lock_lease_s)
+            stmt = (
+                update(JobLock)
+                .where(
+                    JobLock.job_id == job_id,
+                    JobLock.scheduled_time == scheduled_time,
+                    JobLock.owner == self.host_id,
+                    JobLock.owner_token == self.owner_token,
+                    JobLock.expires_at > now,
+                )
+                .values(expires_at=expires_at)
+            )
+            try:
+                async with get_session_context() as session:
+                    result = cast(CursorResult[Any], await session.execute(stmt))
+                    await session.commit()
+                    if result.rowcount != 1:
+                        logger.error("job_lock_lease_lost", job_id=job_id)
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("job_lock_heartbeat_error", job_id=job_id, error=str(error))
+
+    async def _release_lock(
+        self,
+        job_id: str,
+        scheduled_time: datetime.datetime,
+        log: LazyLoggerProxy | None = None,
+    ) -> None:
+        """只释放当前 Worker 持有的任务锁"""
+        stmt = delete(JobLock).where(
+            JobLock.job_id == job_id,
+            JobLock.scheduled_time == scheduled_time,
+            JobLock.owner == self.host_id,
+            JobLock.owner_token == self.owner_token,
+        )
+        try:
+            async with get_session_context() as session:
                 await session.execute(stmt)
                 await session.commit()
-                # 锁获取成功
-                return True
-        except IntegrityError:
-            # 锁已存在（唯一索引冲突）
-            return False
-        except Exception:
-            # 其他异常（如数据库连接失败）返回 False，避免任务在不确定的状态下执行
-            return False
+        except Exception as error:
+            (log or logger).error("release_lock_failed", error=str(error))
+
+    async def recover_expired_locks(self) -> int:
+        """删除已过期的任务锁并返回回收数量"""
+        stmt = delete(JobLock).where(JobLock.expires_at <= utcnow())
+        try:
+            async with get_session_context() as session:
+                result = cast(CursorResult[Any], await session.execute(stmt))
+                await session.commit()
+                return int(result.rowcount or 0)
+        except Exception as error:
+            logger.warning("job_lock_recovery_error", error=str(error))
+            return 0
+        return 0
+
+    async def recover_orphaned_runs(self) -> int:
+        """将超时未结束的 RUNNING 记录标记为孤儿运行"""
+        now = utcnow()
+        cutoff = now - datetime.timedelta(seconds=settings.job_run_orphan_timeout_s)
+        stmt = (
+            update(JobRun)
+            .where(
+                JobRun.status == "RUNNING",
+                JobRun.start_time < cutoff,
+                ~exists().where(
+                    JobLock.job_id == JobRun.job_id,
+                    JobLock.scheduled_time == JobRun.scheduled_time,
+                    JobLock.expires_at > now,
+                ),
+            )
+            .values(
+                status="ABANDONED",
+                end_time=now,
+                error_type="OrphanedRun",
+                error_msg="运行记录超过租约恢复窗口仍未结束",
+            )
+        )
+        try:
+            async with get_session_context() as session:
+                result = cast(CursorResult[Any], await session.execute(stmt))
+                await session.commit()
+                return int(result.rowcount or 0)
+        except Exception as error:
+            logger.warning("job_run_recovery_error", error=str(error))
+            return 0
+        return 0
 
     async def _create_run_record(
-            self, job_id: str, scheduled_time: datetime.datetime, cfg_ver: Optional[int],
-            interval: Optional[DataInterval]
-    ) -> Optional[int]:
+        self,
+        job_id: str,
+        scheduled_time: datetime.datetime,
+        cfg_ver: int | None,
+        interval: DataInterval | None,
+    ) -> int | None:
         """创建任务执行记录（job_run 表）
 
         Args:
@@ -610,42 +739,61 @@ class JobRunner:
             "config_version": cfg_ver,
             "host": self.host_id,
             "pid": os.getpid(),
-            # 当前不支持重试，固定为 1
-            "attempt": 1
         }
         # 如果是有状态任务，添加数据时间窗口
         if interval:
             values["data_time_start"] = interval.start
             values["data_time_end"] = interval.end
 
-        stmt = insert(JobRun).values(**values)
         try:
-            async for session in get_session():
+            async with get_session_context() as session:
+                attempt_result = await session.execute(
+                    select(func.max(JobRun.attempt)).where(
+                        JobRun.job_id == job_id,
+                        JobRun.scheduled_time == scheduled_time,
+                    )
+                )
+                max_attempt = attempt_result.scalar_one()
+                values["attempt"] = int(max_attempt or 0) + 1
+                stmt = insert(JobRun).values(**values)
                 result = await session.execute(stmt)
                 # 获取插入记录的主键（run_id）
-                new_id = cast(CursorResult, result).inserted_primary_key[0]
+                primary_key = cast(Any, result).inserted_primary_key
+                if not primary_key:
+                    await session.rollback()
+                    return None
+                new_id = primary_key[0]
                 await session.commit()
-                return new_id
+                return int(new_id) if new_id is not None else None
         except Exception as e:
             # 记录创建失败（如数据库连接失败）
             logger.error("create_run_record_error", error=str(e))
             return None
 
     async def _finish_run_record(
-            self, run_id: int, status: str, duration_ms: int,
-            error_type: str = None, error_msg: str = None
-    ):
+        self,
+        run_id: int,
+        job_id: str,
+        status: str,
+        duration_ms: int,
+        error_type: str | None = None,
+        error_msg: str | None = None,
+        watermark: datetime.datetime | None = None,
+    ) -> None:
         """更新任务执行记录的最终状态
 
         Args:
             run_id (int): 执行记录的主键
+            job_id (str): 任务的唯一标识符
             status (str): 最终状态（SUCCESS 或 FAILED）
             duration_ms (int): 执行耗时（毫秒）
             error_type (str): 错误类型（如 ValueError、ConnectionError）
             error_msg (str): 错误消息（截断到 500 字符）
+            watermark (datetime.datetime | None): 成功状态任务要提交的新水位线
 
         Note:
             - 错误消息会被截断到 500 字符，防止数据库字段溢出
+            - 成功记录、水位线 CAS 和一次性任务完成标记在同一事务中提交
             - 实际生产中应有专门的错误日志收集系统（如 ELK、Sentry），数据库中的错误信息仅供快速定位问题
         """
         # 构建更新值
@@ -661,6 +809,40 @@ class JobRunner:
             values["error_msg"] = error_msg[:500]
 
         stmt = update(JobRun).where(JobRun.run_id == run_id).values(**values)
-        async for session in get_session():
+        async with get_session_context() as session:
             await session.execute(stmt)
+            if status == "SUCCESS":
+                if watermark is not None:
+                    watermark_stmt = (
+                        update(ScheduledJob)
+                        .where(
+                            ScheduledJob.job_id == job_id,
+                            or_(
+                                ScheduledJob.last_data_time.is_(None),
+                                ScheduledJob.last_data_time < watermark,
+                            ),
+                        )
+                        .values(last_data_time=watermark)
+                    )
+                    watermark_result = cast(
+                        CursorResult[Any], await session.execute(watermark_stmt)
+                    )
+                    if watermark_result.rowcount != 1:
+                        current = await session.execute(
+                            select(ScheduledJob.last_data_time).where(ScheduledJob.job_id == job_id)
+                        )
+                        current_watermark = current.scalar_one_or_none()
+                        if current_watermark is None or current_watermark < watermark:
+                            raise RuntimeError("watermark CAS rejected")
+
+                date_stmt = (
+                    update(ScheduledJob)
+                    .where(
+                        ScheduledJob.job_id == job_id,
+                        ScheduledJob.schedule_type == "date",
+                        ScheduledJob.enabled.is_(True),
+                    )
+                    .values(enabled=False, completed_at=utcnow())
+                )
+                await session.execute(date_stmt)
             await session.commit()

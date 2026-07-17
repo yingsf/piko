@@ -7,11 +7,42 @@ import aiofiles
 
 from piko.config import settings
 from piko.infra.logging import get_logger
-from piko.infra.observability import PERSISTENCE_QUEUE_SIZE
+from piko.infra.observability import (
+    PERSISTENCE_FALLBACK_TOTAL,
+    PERSISTENCE_QUEUE_SIZE,
+    PERSISTENCE_RECOVERY_FAILURE_TOTAL,
+    PERSISTENCE_RECOVERY_TOTAL,
+    PERSISTENCE_SINK_FAILURE_TOTAL,
+)
 from piko.persistence.intent import WriteIntent
 from piko.persistence.sink_base import ResultSink
 
 logger = get_logger(__name__)
+
+
+class PersistenceDeferredError(RuntimeError):
+    """表示数据已落盘等待恢复，但本次 Sink 写入未完成。"""
+
+
+def _write_atomic_text(final_path: str, payload: str) -> None:
+    """将文本以 fsync 加临时文件替换的方式持久化。"""
+    directory = os.path.dirname(final_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{final_path}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, final_path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 class PersistenceWriter:
@@ -33,7 +64,7 @@ class PersistenceWriter:
         start: 启动后台消费任务和磁盘数据恢复
         stop: 优雅关闭：等待队列清空、取消消费任务、磁盘兜底残留数据
         enqueue: 将 WriteIntent 加入队列（异步阻塞，支持背压控制）
-        flush: 同步等待队列清空（测试或手动触发场景）
+        flush: 同步等待队列清空（手动同步场景）
 
     Note:
         核心机制：
@@ -67,23 +98,28 @@ class PersistenceWriter:
         - 磁盘空间不足会导致 dump 失败，需监控磁盘使用率
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化持久化写入引擎"""
         # 创建有界队列，maxsize 提供背压控制（队列满时生产者阻塞）
-        self._queue = asyncio.Queue(maxsize=settings.persist_queue_max)
+        self._queue: asyncio.Queue[WriteIntent] = asyncio.Queue(maxsize=settings.persist_queue_max)
 
         # Sink 路由表：sink_name -> ResultSink 实例
         self._sinks: Dict[str, ResultSink] = {}
 
         # 运行状态标志和后台任务引用
         self._running = False
-        self._consumer_task: asyncio.Task | None = None
+        self._consumer_task: asyncio.Task[None] | None = None
 
         # 批量写入参数：从配置读取（默认值作为兜底）
-        self._batch_size = 100
-        self._batch_timeout = 0.5
+        self._batch_size = int(getattr(settings, "persist_batch_size", 100))
+        self._batch_timeout = float(getattr(settings, "persist_batch_timeout_s", 0.5))
+        if self._batch_size < 1:
+            raise ValueError("persist_batch_size must be greater than zero")
+        if self._batch_timeout < 0:
+            raise ValueError("persist_batch_timeout_s must not be negative")
+        self._deferred_since_flush = False
 
-    def register_sink(self, sink: ResultSink):
+    def register_sink(self, sink: ResultSink) -> None:
         """注册一个 Sink 实例到路由表
 
         Args:
@@ -97,7 +133,12 @@ class PersistenceWriter:
         """
         self._sinks[sink.name] = sink
 
-    async def start(self):
+    @property
+    def is_running(self) -> bool:
+        """返回 Writer 是否已启动并能接收持久化意图。"""
+        return self._running
+
+    async def start(self) -> None:
         """启动后台消费任务并恢复磁盘数据
 
         执行步骤：
@@ -126,7 +167,7 @@ class PersistenceWriter:
 
         logger.info("persistence_writer_started")
 
-    async def stop(self):
+    async def stop(self) -> None:
         """优雅关闭持久化写入引擎
 
         三阶段关闭流程：
@@ -151,10 +192,7 @@ class PersistenceWriter:
             try:
                 # 第一阶段：等待队列清空（带超时）
                 # queue.join() 会等待所有 task_done() 调用完成
-                await asyncio.wait_for(
-                    self._queue.join(),
-                    timeout=settings.persist_flush_timeout_s
-                )
+                await asyncio.wait_for(self._queue.join(), timeout=settings.persist_flush_timeout_s)
             except asyncio.TimeoutError:
                 # 超时触发：记录警告并进入兜底流程
                 logger.warning("persist_flush_timeout_triggering_fallback")
@@ -168,7 +206,7 @@ class PersistenceWriter:
             # 此时消费者已停止，队列中可能还有未处理的数据
             await self._dump_to_disk()
 
-    async def enqueue(self, intent: WriteIntent):
+    async def enqueue(self, intent: WriteIntent) -> None:
         """将 WriteIntent 加入队列（异步阻塞，支持背压控制）
 
         Args:
@@ -203,21 +241,26 @@ class PersistenceWriter:
         # 更新监控指标：队列当前大小
         PERSISTENCE_QUEUE_SIZE.set(self._queue.qsize())
 
-    async def flush(self):
-        """同步等待队列清空（测试或手动触发场景）
+    async def flush(self) -> None:
+        """同步等待队列清空
 
         Note:
             使用场景：
-            - 单元测试：确保所有数据已写入后再断言
-            - 手动触发：定时任务或管理命令中强制刷新
+            - 管理命令可在返回前确认已入队的数据完成处理
+            - 任务处理器可在依赖下游结果前主动刷新
 
             与 stop() 的区别：
             - flush() 仅等待队列清空，不停止消费者
             - stop() 会停止消费者并 dump 残留数据
         """
         await self._queue.join()
+        if self._deferred_since_flush:
+            self._deferred_since_flush = False
+            raise PersistenceDeferredError(
+                "Persistence sink failed; intents were durably written to disk fallback"
+            )
 
-    async def _consumer_loop(self):
+    async def _consumer_loop(self) -> None:
         """主消费循环（后台持续运行）
 
         核心逻辑：
@@ -242,7 +285,7 @@ class PersistenceWriter:
             except Exception as e:
                 await self._handle_unexpected_error(e, buffer)
 
-    async def _process_next_batch(self, buffer: List[WriteIntent]):
+    async def _process_next_batch(self, buffer: List[WriteIntent]) -> None:
         """处理下一个批次（收集 -> 写入 -> ack）
 
         Args:
@@ -263,7 +306,7 @@ class PersistenceWriter:
             # 清空 buffer，复用列表对象（避免重新分配内存）
             buffer.clear()
 
-    async def _handle_shutdown_signal(self, buffer: List[WriteIntent]):
+    async def _handle_shutdown_signal(self, buffer: List[WriteIntent]) -> None:
         """处理停机信号（CancelledError 场景）
 
         Args:
@@ -279,7 +322,7 @@ class PersistenceWriter:
             # 安全写入：失败时自动 dump
             await self._flush_safe_and_ack(buffer)
 
-    async def _handle_unexpected_error(self, e: Exception, buffer: List[WriteIntent]):
+    async def _handle_unexpected_error(self, e: Exception, buffer: List[WriteIntent]) -> None:
         """处理未知异常（容错机制）
 
         Args:
@@ -310,7 +353,7 @@ class PersistenceWriter:
         # 休眠 1 秒，避免异常死循环（限流）
         await asyncio.sleep(1)
 
-    async def _fill_batch(self, buffer: List[WriteIntent]):
+    async def _fill_batch(self, buffer: List[WriteIntent]) -> None:
         """从队列中收集一批数据（批量聚合算法）
 
         Args:
@@ -360,7 +403,7 @@ class PersistenceWriter:
                 # 超时退出（正常流程，不是异常）
                 break
 
-    async def _flush_and_ack(self, batch: List[WriteIntent]):
+    async def _flush_and_ack(self, batch: List[WriteIntent]) -> None:
         """批量写入并 ack 队列任务
 
         Args:
@@ -387,7 +430,7 @@ class PersistenceWriter:
             # 更新监控指标：队列当前大小
             PERSISTENCE_QUEUE_SIZE.set(self._queue.qsize())
 
-    async def _flush_safe_and_ack(self, batch: List[WriteIntent]):
+    async def _flush_safe_and_ack(self, batch: List[WriteIntent]) -> None:
         """安全批量写入并 ack（停机场景）
 
         Args:
@@ -407,7 +450,7 @@ class PersistenceWriter:
             for _ in batch:
                 self._queue.task_done()
 
-    async def _flush(self, batch: List[WriteIntent]):
+    async def _flush(self, batch: List[WriteIntent]) -> None:
         """批量写入到对应的 Sink（按 Sink 分组并调用 write_batch）
 
         Args:
@@ -437,7 +480,9 @@ class PersistenceWriter:
         for sink_name, items in grouped.items():
             sink = self._sinks.get(sink_name)
             if not sink:
-                # Sink 未注册（理论上不会发生，enqueue 时已校验）
+                logger.error("unknown_sink_during_flush", sink=sink_name, count=len(items))
+                await self._dump_buffer_to_disk(items, suffix="_unknown_sink")
+                self._deferred_since_flush = True
                 continue
 
             try:
@@ -447,9 +492,11 @@ class PersistenceWriter:
             except Exception as e:
                 # 写入失败，记录错误并 dump 到磁盘
                 logger.error("batch_write_failed", sink=sink_name, count=len(items), error=str(e))
+                PERSISTENCE_SINK_FAILURE_TOTAL.labels(sink=sink_name).inc()
                 await self._dump_buffer_to_disk(items, suffix="_failed")
+                self._deferred_since_flush = True
 
-    async def _flush_safe(self, batch: List[WriteIntent]):
+    async def _flush_safe(self, batch: List[WriteIntent]) -> None:
         """安全批量写入（捕获所有异常并 dump 到磁盘）
 
         Args:
@@ -468,7 +515,7 @@ class PersistenceWriter:
             logger.error("final_flush_failed", error=str(e))
             await self._dump_buffer_to_disk(batch, suffix="_final")
 
-    async def _dump_to_disk(self):
+    async def _dump_to_disk(self) -> None:
         """将队列中的残留数据 dump 到磁盘（停机兜底）
 
         Note:
@@ -482,7 +529,7 @@ class PersistenceWriter:
             3. ack 队列任务（避免 join() 阻塞）
         """
         # 取出队列中的所有剩余数据（非阻塞）
-        remaining = []
+        remaining: list[WriteIntent] = []
         while not self._queue.empty():
             try:
                 # get_nowait：非阻塞取出，队列空时抛出 QueueEmpty
@@ -498,7 +545,7 @@ class PersistenceWriter:
             for _ in remaining:
                 self._queue.task_done()
 
-    async def _dump_buffer_to_disk(self, items: List[WriteIntent], suffix: str = ""):
+    async def _dump_buffer_to_disk(self, items: List[WriteIntent], suffix: str = "") -> bool:
         """将 buffer 数据原子写入磁盘
 
         Args:
@@ -521,33 +568,23 @@ class PersistenceWriter:
             - 需要监控此日志，触发告警（磁盘空间不足、权限问题等）
         """
         # 构造基础路径（来自配置）
-        path = f"{settings.persist_disk_fallback_path}{suffix}"
-
-        # 生成唯一文件名（添加 4 字节随机后缀，避免并发冲突）
-        unique_path = f"{path}.{os.urandom(4).hex()}.jsonl"
+        fallback_path = str(settings.persist_disk_fallback_path)
+        unique_path = f"{fallback_path}{suffix}.{os.urandom(8).hex()}.pending"
 
         try:
-            # 第一步：序列化所有 Intent 为 JSONL 格式
-            lines = []
-            for item in items:
-                # model_dump_json：Pydantic 序列化方法（自动处理 datetime 等类型）
-                lines.append(item.model_dump_json())
-
-            # 拼接为单个字符串（每行一个 JSON，末尾加换行符）
-            payload = "\n".join(lines) + "\n"
-
-            # 第二步：原子写入临时文件
-            # 使用 aiofiles 异步写入，避免阻塞事件循环
-            async with aiofiles.open(unique_path, 'w') as f:
-                await f.write(payload)
+            payload = "\n".join(item.model_dump_json() for item in items) + "\n"
+            await asyncio.to_thread(_write_atomic_text, unique_path, payload)
+            PERSISTENCE_FALLBACK_TOTAL.inc(len(items))
 
             logger.warning("data_dumped_to_disk", path=unique_path, count=len(items))
+            return True
         except Exception as e:
             # dump 失败：记录 critical 日志（数据丢失风险）
             # 需要监控此日志并触发告警（磁盘故障、权限问题等）
             logger.critical("disk_fallback_failed_data_lost", error=str(e), count=len(items))
+            return False
 
-    async def _recover_from_disk(self):
+    async def _recover_from_disk(self) -> None:
         """启动时恢复磁盘中的兜底数据
 
         Note:
@@ -565,22 +602,21 @@ class PersistenceWriter:
             - 单行解析失败不影响其他行（记录错误后跳过）
         """
         # 获取兜底目录和文件名前缀
-        base_dir = os.path.dirname(settings.persist_disk_fallback_path)
-        filename_prefix = os.path.basename(settings.persist_disk_fallback_path)
+        fallback_path = str(settings.persist_disk_fallback_path)
+        base_dir = os.path.dirname(fallback_path) or "."
+        filename_prefix = os.path.basename(fallback_path)
 
         # 若目录不存在，直接返回（首次启动场景）
-        if not os.path.exists(base_dir):
+        if not os.path.isdir(base_dir):
             return
 
         # 扫描目录，查找符合条件的文件
-        for fname in os.listdir(base_dir):
-            # 过滤规则：前缀匹配 且 未恢复
-            if fname.startswith(filename_prefix) and not fname.endswith(".recovered"):
-                full_path = os.path.join(base_dir, fname)
-                # 逐文件恢复（委托给辅助方法）
-                await self._recover_single_file(full_path)
+        for fname in sorted(os.listdir(base_dir)):
+            is_pending = fname.endswith(".pending") or fname.endswith(".jsonl")
+            if fname.startswith(filename_prefix) and is_pending:
+                await self._recover_single_file(os.path.join(base_dir, fname))
 
-    async def _recover_single_file(self, full_path: str):
+    async def _recover_single_file(self, full_path: str) -> None:
         """恢复单个兜底文件（逐行解析 JSONL）
 
         Args:
@@ -598,38 +634,42 @@ class PersistenceWriter:
             - 整个文件恢复失败：记录错误（文件可能损坏）
         """
         logger.info("found_fallback_data", path=full_path)
-        # 统计恢复的记录数
-        recovered_count = 0
+        intents: list[WriteIntent] = []
+        failed_lines: list[str] = []
 
         try:
-            async with aiofiles.open(full_path, 'r') as f:
-                # 逐行读取（JSONL 格式）
-                async for line in f:
-                    line = line.strip()
+            async with aiofiles.open(full_path, "r", encoding="utf-8") as fallback_file:
+                async for raw_line in fallback_file:
+                    line = raw_line.strip()
                     if not line:
-                        # 跳过空行
                         continue
-
                     try:
-                        # 第一步：解析 JSON
-                        data = json.loads(line)
+                        intents.append(WriteIntent.model_validate(json.loads(line)))
+                    except Exception as error:
+                        failed_lines.append(line)
+                        logger.error("fallback_parse_line_error", error=str(error))
 
-                        # 第二步：反序列化为 WriteIntent
-                        intent = WriteIntent.model_validate(data)
+            if failed_lines:
+                failed_path = f"{full_path}.failed"
+                failed_payload = "\n".join(failed_lines) + "\n"
+                await asyncio.to_thread(_write_atomic_text, failed_path, failed_payload)
+                PERSISTENCE_RECOVERY_FAILURE_TOTAL.inc(len(failed_lines))
+                logger.error(
+                    "fallback_records_retained_for_manual_recovery",
+                    path=failed_path,
+                    count=len(failed_lines),
+                )
 
-                        # 第三步：入队（会触发 Sink 校验）
-                        await self.enqueue(intent)
-                        recovered_count += 1
-                    except Exception as parse_err:
-                        logger.error("fallback_parse_line_error", error=str(parse_err))
+            for intent in intents:
+                await self.enqueue(intent)
 
-            # 恢复成功：重命名文件（避免重复恢复）
-            os.rename(full_path, full_path + ".recovered")
-            logger.info("fallback_data_recovered", path=full_path, count=recovered_count)
-        except Exception as e:
-            # 整个文件恢复失败：记录错误（文件可能损坏）
-            logger.error("recover_failed", path=full_path, error=str(e))
-
-
-# 全局单例：应用启动时创建，全局共享
-persistence_writer = PersistenceWriter()
+            os.replace(full_path, f"{full_path}.recovered")
+            PERSISTENCE_RECOVERY_TOTAL.inc(len(intents))
+            logger.info(
+                "fallback_data_recovered",
+                path=full_path,
+                count=len(intents),
+                failed_count=len(failed_lines),
+            )
+        except Exception as error:
+            logger.error("recover_failed", path=full_path, error=str(error))

@@ -1,0 +1,3 @@
+class DateTrigger:
+    timezone: object
+    def __init__(self, *, timezone: object | None = None, **kwargs: object) -> None: ...

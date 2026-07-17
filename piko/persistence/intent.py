@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class WriteIntent(BaseModel):
@@ -45,6 +45,14 @@ class WriteIntent(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
+
+    @model_validator(mode="after")
+    def fill_model_ref(self) -> Self:
+        """为 Pydantic payload 记录受控的类型引用。"""
+        if self.model_ref is None and isinstance(self.payload, BaseModel):
+            model_type = type(self.payload)
+            self.model_ref = f"{model_type.__module__}:{model_type.__qualname__}"
+        return self
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -88,8 +96,7 @@ class WriteIntent(BaseModel):
         val = self.payload
         # 运行时类型推断：仅对 Pydantic Model 有效
         if isinstance(val, BaseModel):
-            return f"{val.__class__.__module__}.{val.__class__.__name__}"
+            return f"{val.__class__.__module__}:{val.__class__.__qualname__}"
 
         # 兜底：纯字典类型
         return "dict"
-    

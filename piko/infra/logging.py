@@ -1,11 +1,15 @@
 import logging
 import logging.config
-import sys
-from typing import Any
+import inspect
+from collections.abc import Callable
+from typing import Any, Literal, cast
 
 import structlog
 
 from piko.config import settings
+
+
+_logging_config_generation = 0
 
 
 class LazyLoggerProxy:
@@ -31,9 +35,11 @@ class LazyLoggerProxy:
             name (str): Logger 的名称（通常是模块名，如 "piko.core.runner"）
         """
         self.name = name
-        self._binds: dict[str, Any] = {"module": name}
+        self._binds: dict[str, object] = {"module": name}
+        self._bound_logger: Any | None = None
+        self._bound_logger_generation = -1
 
-    def bind(self, **kwargs):
+    def bind(self, **kwargs: object) -> "LazyLoggerProxy":
         """绑定上下文信息（支持链式调用）
 
         将键值对绑定到 Logger，后续所有日志调用都会自动附加这些字段
@@ -48,7 +54,12 @@ class LazyLoggerProxy:
         new_proxy._binds = {**self._binds, **kwargs}
         return new_proxy
 
-    def _proxy_to_real(self, method_name: str, event: str, **kwargs):
+    def _proxy_to_real(
+        self,
+        method_name: Literal["debug", "info", "warning", "error", "critical", "exception"],
+        event: str,
+        **kwargs: object,
+    ) -> None:
         """代理到真正的 structlog Logger（核心转发逻辑）
 
         在每次调用日志方法时，才从 structlog 获取最新的 Logger，应用绑定的上下文，然后调用真正的日志方法
@@ -58,35 +69,41 @@ class LazyLoggerProxy:
             event (str): 日志事件名称（第一个参数）
             **kwargs: 日志的额外字段
         """
-        real_logger = structlog.get_logger()
-        bound_logger = real_logger.bind(**self._binds)
-        getattr(bound_logger, method_name)(event, **kwargs)
+        if (
+            self._bound_logger is None
+            or self._bound_logger_generation != _logging_config_generation
+        ):
+            self._bound_logger = structlog.get_logger().bind(**self._binds)
+            self._bound_logger_generation = _logging_config_generation
+        bound_logger = self._bound_logger
+        log_method = cast(Callable[..., None], getattr(bound_logger, method_name))
+        log_method(event, **kwargs)
 
-    def trace(self, event: str, **kwargs):
+    def trace(self, event: str, **kwargs: object) -> None:
         """记录 TRACE 级别日志（映射为 DEBUG）"""
         self._proxy_to_real("debug", event, **kwargs)
 
-    def debug(self, event: str, **kwargs):
+    def debug(self, event: str, **kwargs: object) -> None:
         """记录 DEBUG 级别日志"""
         self._proxy_to_real("debug", event, **kwargs)
 
-    def info(self, event: str, **kwargs):
+    def info(self, event: str, **kwargs: object) -> None:
         """记录 INFO 级别日志"""
         self._proxy_to_real("info", event, **kwargs)
 
-    def warning(self, event: str, **kwargs):
+    def warning(self, event: str, **kwargs: object) -> None:
         """记录 WARNING 级别日志"""
         self._proxy_to_real("warning", event, **kwargs)
 
-    def error(self, event: str, **kwargs):
+    def error(self, event: str, **kwargs: object) -> None:
         """记录 ERROR 级别日志"""
         self._proxy_to_real("error", event, **kwargs)
 
-    def critical(self, event: str, **kwargs):
+    def critical(self, event: str, **kwargs: object) -> None:
         """记录 CRITICAL 级别日志"""
         self._proxy_to_real("critical", event, **kwargs)
 
-    def exception(self, event: str, **kwargs):
+    def exception(self, event: str, **kwargs: object) -> None:
         """记录异常日志（自动附加堆栈信息）
 
         Note:
@@ -95,7 +112,7 @@ class LazyLoggerProxy:
         self._proxy_to_real("exception", event, **kwargs)
 
 
-def _get_shared_processors():
+def _get_shared_processors() -> list[Any]:
     """获取共享的日志处理器列表"""
     return [
         structlog.contextvars.merge_contextvars,
@@ -106,13 +123,15 @@ def _get_shared_processors():
     ]
 
 
-def setup_logging():
+def setup_logging() -> None:
     """全局初始化日志系统
 
     本函数配置 structlog 和标准库 logging，确保：
         1. 所有日志使用统一的格式（JSON 或 Console）
         2. 标准库的日志（如 uvicorn、apscheduler）也通过 structlog 输出
     """
+    global _logging_config_generation
+
     shared_processors = _get_shared_processors()
 
     if settings.log_json:
@@ -134,9 +153,10 @@ def setup_logging():
     )
 
     _configure_stdlib_logging(processors)
+    _logging_config_generation += 1
 
 
-def _configure_stdlib_logging(processors):
+def _configure_stdlib_logging(processors: list[Any]) -> None:
     """拦截标准库 logging，转发给 structlog"""
     pre_chain = [
         structlog.stdlib.add_log_level,
@@ -145,46 +165,47 @@ def _configure_stdlib_logging(processors):
         structlog.processors.TimeStamper(fmt="iso", utc=False),
     ]
 
-    logging.config.dictConfig({
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "structlog_formatter": {
-                "()": structlog.stdlib.ProcessorFormatter,
-                "processor": processors[-1],
-                "foreign_pre_chain": pre_chain,
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "structlog_formatter": {
+                    "()": structlog.stdlib.ProcessorFormatter,
+                    "processor": processors[-1],
+                    "foreign_pre_chain": pre_chain,
+                },
             },
-        },
-        "handlers": {
-            "default": {
-                "level": "INFO",
-                "class": "logging.StreamHandler",
-                "formatter": "structlog_formatter"
+            "handlers": {
+                "default": {
+                    "level": "INFO",
+                    "class": "logging.StreamHandler",
+                    "formatter": "structlog_formatter",
+                },
             },
-        },
-        "root": {
-            "handlers": ["default"],
-            "level": settings.log_level.upper()
-        },
-        "loggers": {
-            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-            "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
-            "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
-            "apscheduler": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "root": {"handlers": ["default"], "level": settings.log_level.upper()},
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "apscheduler": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            },
         }
-    })
+    )
 
 
-def get_logger(name: str | None = None):
+def get_logger(name: str | None = None) -> LazyLoggerProxy:
     """获取 Logger（推荐使用 `get_logger(__name__)`）
 
     Returns:
         LazyLoggerProxy: 惰性 Logger 代理实例
     """
     if name is None:
-        try:
-            name = sys._getframe(1).f_globals.get("__name__", "piko")
-        except (AttributeError, ValueError):
-            name = "piko"
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        module_name = caller.f_globals.get("__name__") if caller is not None else None
+        name = module_name if isinstance(module_name, str) else "piko"
+        del frame
+        del caller
 
     return LazyLoggerProxy(name)

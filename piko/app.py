@@ -2,28 +2,36 @@ import asyncio
 import importlib
 import pkgutil
 import signal
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from types import ModuleType
 from typing import Type, Dict, List, Set
 
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from piko.compute.manager import CpuManager
 from piko.config import settings
 from piko.core.cache import ConfigCache
-from piko.core.registry import JobRegistry
+from piko.core.registry import JobHandler, JobRegistry
 from piko.core.resource import Resource
 from piko.core.runner import JobRunner
 from piko.core.scheduler import SchedulerManager
 from piko.core.types import BackfillPolicy
 from piko.core.watcher import ConfigWatcher
-from piko.infra.db import init_db, create_all_tables, get_session, ScheduledJob
+from piko.infra.db import (
+    check_database_connection,
+    get_session_context,
+    init_db,
+    reset_db,
+    ScheduledJob,
+    verify_schema,
+)
 from piko.infra.leader import get_leader_mutex, get_leader_watchdog
 from piko.infra.logging import get_logger, setup_logging
-from piko.infra.observability import metrics_endpoint, CONTENT_TYPE_LATEST
+from piko.infra.observability import metrics_endpoint
 from piko.persistence.writer import PersistenceWriter
 
 logger = get_logger(__name__)
@@ -55,6 +63,7 @@ class PikoApp:
         """
         self.name = name
         self._shutdown_event = asyncio.Event()
+        self._started = False
 
         # ==========================================================
         # 1. 实例化核心组件
@@ -63,16 +72,14 @@ class PikoApp:
         self.config_cache = ConfigCache()
         self.writer = PersistenceWriter()
 
-        # CPU 计算池（由 App 实例持有，不再是全局单例）
+        # CPU 计算池由应用实例持有
         self.cpu_manager = CpuManager()
 
         # ==========================================================
         # 2. 组装组件 (依赖注入)
         # ==========================================================
         self.runner = JobRunner(
-            registry=self.registry,
-            config_cache=self.config_cache,
-            writer=self.writer
+            registry=self.registry, config_cache=self.config_cache, writer=self.writer
         )
 
         self.scheduler = SchedulerManager()
@@ -81,13 +88,22 @@ class PikoApp:
             scheduler_manager=self.scheduler,
             config_cache=self.config_cache,
             registry=self.registry,
-            runner=self.runner
+            runner=self.runner,
         )
 
         # ==========================================================
         # 3. 初始化运维 API
         # ==========================================================
-        self.api_app = FastAPI(lifespan=self._lifespan_context, title=f"{name} Worker")
+        docs_url = "/docs" if settings.api_docs_enabled else None
+        redoc_url = "/redoc" if settings.api_docs_enabled else None
+        openapi_url = "/openapi.json" if settings.api_docs_enabled else None
+        self.api_app = FastAPI(
+            lifespan=self._lifespan_context,
+            title=f"{name} Worker",
+            docs_url=docs_url,
+            redoc_url=redoc_url,
+            openapi_url=openapi_url,
+        )
         self._register_api_routes()
 
         # ==========================================================
@@ -157,27 +173,45 @@ class PikoApp:
     def _register_api_routes(self):
         """注册内置的运维 API 路由"""
 
-        @self.api_app.get("/healthz")
         async def healthz():
             """健康检查端点 (Liveness Probe)"""
-            return {"status": "ok", "shutdown": self.is_shutdown_initiated}
+            status = "shutting_down" if self.is_shutdown_initiated else "ok"
+            return JSONResponse(content={"status": status, "shutdown": self.is_shutdown_initiated})
 
-        @self.api_app.get("/readyz")
+        self.api_app.add_api_route("/healthz", healthz, methods=["GET"])
+
         async def readyz():
             """就绪检查端点 (Readiness Probe)
 
-            如果是 Leader/Follower 架构，非 Leader 节点可能返回 standby 状态。
+            检查启动完成、数据库、Writer、Watcher、Scheduler 和 Leader 状态。
             """
             leader = get_leader_mutex()
+            checks = {
+                "started": self._started,
+                "database": await check_database_connection(),
+                "writer": self.writer.is_running,
+                "watcher": self.watcher.is_running,
+                "scheduler": self.scheduler.is_running,
+                "leader": not settings.leader_enabled or leader.is_leader,
+            }
+            ready = all(checks.values()) and not self.is_shutdown_initiated
+            status = "ready" if ready else "not_ready"
             if settings.leader_enabled and not leader.is_leader:
-                return {"status": "standby", "ready": False}
-            return {"status": "leader", "ready": True}
+                status = "standby"
+            return JSONResponse(
+                status_code=200 if ready else 503,
+                content={"status": status, "ready": ready, "checks": checks},
+            )
 
-        @self.api_app.get("/metrics")
+        self.api_app.add_api_route("/readyz", readyz, methods=["GET"])
+
         async def metrics():
             """Prometheus 指标端点"""
-            data = metrics_endpoint()
-            return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+            if not settings.metrics_enabled:
+                return JSONResponse(status_code=404, content={"detail": "metrics disabled"})
+            return metrics_endpoint()
+
+        self.api_app.add_api_route("/metrics", metrics, methods=["GET"])
 
     @property
     def is_shutdown_initiated(self) -> bool:
@@ -185,13 +219,13 @@ class PikoApp:
         return self._shutdown_event.is_set()
 
     def job(
-            self,
-            job_id: str,
-            schema: Type[BaseModel] | None = None,
-            stateful: bool = False,
-            backfill_policy: BackfillPolicy = BackfillPolicy.SKIP,
-            resources: Dict[str, Type[Resource]] | None = None
-    ):
+        self,
+        job_id: str,
+        schema: Type[BaseModel] | None = None,
+        stateful: bool = False,
+        backfill_policy: BackfillPolicy = BackfillPolicy.SKIP,
+        resources: Dict[str, Type[Resource]] | None = None,
+    ) -> Callable[[JobHandler], JobHandler]:
         """装饰器：注册任务到当前 App 实例
 
         Args:
@@ -209,7 +243,7 @@ class PikoApp:
             schema=schema,
             stateful=stateful,
             backfill_policy=backfill_policy,
-            resources=resources
+            resources=resources,
         )
 
     async def startup(self):
@@ -227,7 +261,13 @@ class PikoApp:
 
         try:
             init_db()
-            await create_all_tables()
+            await verify_schema()
+            recovered_locks = await self.runner.recover_expired_locks()
+            if recovered_locks:
+                logger.warning("expired_job_locks_recovered", count=recovered_locks)
+            recovered_runs = await self.runner.recover_orphaned_runs()
+            if recovered_runs:
+                logger.warning("orphaned_job_runs_recovered", count=recovered_runs)
 
             if settings.leader_enabled:
                 await get_leader_mutex().ensure_seed()
@@ -246,6 +286,7 @@ class PikoApp:
             # 启动时检查：代码里的 Job 是否在 DB 里配置了
             await self._check_scheduler_integrity()
 
+            self._started = True
             logger.info("piko_app_started")
         except Exception as e:
             logger.critical("piko_startup_unexpected_error", error=str(e))
@@ -260,19 +301,19 @@ class PikoApp:
         registered_jobs = set(self.registry.get_all_job_ids())
 
         if not registered_jobs:
-            logger.warning("⚠️ No jobs registered in code. Did you forget @app.job or auto_discover_jobs?")
+            logger.warning(
+                "⚠️ No jobs registered in code. Did you forget @app.job or auto_discover_jobs?"
+            )
             return
 
         # 2. 获取数据库中配置的所有 Job ID
         db_jobs: Set[str] = set()
         try:
-            async for session in get_session():
+            async with get_session_context() as session:
                 # 查询所有启用的任务
                 stmt = select(ScheduledJob.job_id).where(ScheduledJob.enabled.is_(True))
                 result = await session.execute(stmt)
                 db_jobs = set(result.scalars().all())
-                # 只需要获取一次
-                break
         except Exception as e:
             logger.warning(f"⚠️ Failed to check DB integrity: {e}")
             return
@@ -287,7 +328,8 @@ class PikoApp:
                 "   但是 'scheduled_job' 表为空或所有任务都被禁用。\n"
                 "   👉 操作：您必须在 'scheduled_job' 和 'job_config' 表中插入记录。\n"
                 "   (您的代码没有问题，但 Piko 是配置驱动的。没有数据库记录 = 不会执行)\n"
-                + "=" * 60
+                + "="
+                * 60
             )
 
             return
@@ -316,17 +358,29 @@ class PikoApp:
         4. 停止持久化写入 (确保缓冲数据落盘)
         5. 停止 CPU 计算池
         """
-        logger.info("piko_app_shutdown_begin")
-        self.scheduler.shutdown()
+        self._shutdown_event.set()
+        self._started = False
+        timeout_s = float(getattr(settings, "shutdown_timeout_s", 30))
+        logger.info("piko_app_shutdown_begin", timeout_s=timeout_s)
+        try:
+            await asyncio.wait_for(self._shutdown_components(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.critical("piko_shutdown_timeout", timeout_s=timeout_s)
+        else:
+            logger.info("piko_app_shutdown_complete")
+
+    async def _shutdown_components(self) -> None:
+        """按逆序关闭组件，供总停机预算统一约束。"""
         await self.watcher.stop()
+        await asyncio.to_thread(self.scheduler.shutdown)
 
         if settings.leader_enabled:
             await get_leader_watchdog().stop()
             await get_leader_mutex().release()
 
         await self.writer.stop()
-        self.cpu_manager.shutdown()
-        logger.info("piko_app_shutdown_complete")
+        await asyncio.to_thread(self.cpu_manager.shutdown)
+        await reset_db()
 
     @asynccontextmanager
     async def _lifespan_context(self, _app: FastAPI):

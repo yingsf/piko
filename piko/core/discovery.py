@@ -20,15 +20,16 @@ def _resolve_package(package: Union[str, ModuleType]) -> Optional[ModuleType]:
     Returns:
         Optional[ModuleType]: 解析成功且合法的包对象；若解析失败或校验不通过则返回 None。
     """
-    resolved_pkg = package
-
-    # 1. 如果传入的是字符串，尝试导入
     if isinstance(package, str):
         try:
             resolved_pkg = importlib.import_module(package)
         except ImportError as e:
-            logger.error(f"Autodiscover failed: Could not import root package {package!r}. details: {e}")
+            logger.error(
+                f"Autodiscover failed: Could not import root package {package!r}. details: {e}"
+            )
             return None
+    else:
+        resolved_pkg = package
 
     # 2. 核心校验：只有包含 __path__ 属性的模块才是“包”，才能被 pkgutil 遍历
     # 如果用户传入了一个普通模块文件 (e.g. utils.py)，这里应拦截并报错
@@ -99,4 +100,6 @@ def autodiscover(package: Union[str, ModuleType], module_name: str = "jobs") -> 
             f"Please check if your job files are named '{module_name}.py' and have __init__.py in directories."
         )
     else:
-        logger.info(f"Piko Autodiscover: Loaded {discovered_count} job modules from '{root_package.__name__}'")
+        logger.info(
+            f"Piko Autodiscover: Loaded {discovered_count} job modules from '{root_package.__name__}'"
+        )

@@ -24,18 +24,20 @@ class BackfillPolicy(str, Enum):
 
     Example:
         ```python
-        from piko.core.registry import job
+        from piko import PikoApp
         from piko.core.types import BackfillPolicy
 
+        app = PikoApp()
+
         # 数据同步任务：使用 CATCH_UP 策略
-        @job("sync_users", stateful=True, backfill_policy=BackfillPolicy.CATCH_UP)
+        @app.job("sync_users", stateful=True, backfill_policy=BackfillPolicy.CATCH_UP)
         async def sync_users(ctx, scheduled_time):
             interval = ctx["data_interval"]
             # 同步 interval.start 到 interval.end 之间的数据
             pass
 
         # 监控告警任务：使用 SKIP 策略
-        @job("health_check", stateful=True, backfill_policy=BackfillPolicy.SKIP)
+        @app.job("health_check", stateful=True, backfill_policy=BackfillPolicy.SKIP)
         async def health_check(ctx, scheduled_time):
             # 只检查当前状态，不关心历史
             pass
@@ -47,6 +49,7 @@ class BackfillPolicy(str, Enum):
         - 如果任务调度频率很高（如每分钟一次），CATCH_UP 可能导致长时间的补跑，
           应谨慎使用或设置 backfill_max_loops 限制补跑次数
     """
+
     # 追赶模式：补齐所有漏掉的周期 (默认)
     CATCH_UP = "catch_up"
     # 跳过模式：忽略过去，只跑最新的 (类似 Airflow catchup=False)
@@ -100,6 +103,7 @@ class DataInterval:
         - 对于无状态任务，start == end，表示这是一个触发时间点而非时间段
         - 建议在数据查询时使用 `WHERE timestamp >= start AND timestamp < end`，确保数据不重复不遗漏
     """
+
     # 包含
     start: datetime
     # 不包含
@@ -139,7 +143,7 @@ class DataInterval:
         """
         return self.start.date()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """返回时间窗口的字符串表示（便于调试和日志）
 
         Returns:
@@ -160,4 +164,3 @@ class DataInterval:
             - 在日志中打印 DataInterval 时会自动调用此方法
         """
         return f"DataInterval[{self.start.isoformat()} -> {self.end.isoformat()}]"
-    

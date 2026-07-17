@@ -1,74 +1,82 @@
 import json
+import os
 
 import pytest
-from sqlalchemy import insert, delete
+from sqlalchemy import delete, insert, update
 
 import piko.infra.db as db_infra
-from piko.core.registry import job
-from piko.core.scheduler import scheduler_manager
-from piko.core.watcher import config_watcher
-from piko.infra.db import ScheduledJob, JobConfig
+from piko import PikoApp
+from piko.infra.db import JobConfig, ScheduledJob
+from piko.infra.leader import LeaderMutex
 
 
+pytestmark = pytest.mark.integration
+
+
+@pytest.mark.skipif(
+    not os.getenv("PIKO_TEST_MYSQL_DSN"),
+    reason="需要通过 PIKO_TEST_MYSQL_DSN 指定隔离测试数据库",
+)
 @pytest.mark.asyncio
-async def test_watcher_reconcile():
-    # 0. 准备环境
+async def test_watcher_reconcile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证应用实例中的 Watcher 同步数据库配置"""
+    app = PikoApp(name="watcher-test")
     db_infra.init_db()
     await db_infra.create_all_tables()
 
-    # 注册一个白名单任务 (否则 Watcher 会忽略)
-    @job(job_id="watcher_test_job")
-    async def noop(ctx, ts):
-        pass
+    @app.job(job_id="watcher_test_job")
+    async def noop(ctx: dict[str, object], ts: object) -> None:
+        return None
 
-    # 1. 插入测试数据到 DB
-    async with db_infra._session_maker() as session:
-        # 清理
+    assert app.registry.get_job("watcher_test_job") is noop
+    monkeypatch.setattr(LeaderMutex, "is_leader", property(lambda _: True))
+
+    async with db_infra.get_session_context() as session:
         await session.execute(delete(ScheduledJob))
         await session.execute(delete(JobConfig))
-
-        # 插入 Job (每1秒运行一次)
-        stmt_job = insert(ScheduledJob).values(
-            job_id="watcher_test_job",
-            schedule_type="interval",
-            schedule_expr=json.dumps({"seconds": 1}),
-            enabled=True,
-            version=1
+        await session.execute(
+            insert(ScheduledJob).values(
+                job_id="watcher_test_job",
+                schedule_type="interval",
+                schedule_expr=json.dumps({"seconds": 1}),
+                timezone="UTC",
+                misfire_grace_s=17,
+                coalesce=False,
+                max_instances=2,
+                jitter_s=3,
+                executor="io",
+                enabled=True,
+                version=1,
+            )
         )
-        # 插入 Config
-        stmt_cfg = insert(JobConfig).values(
-            job_id="watcher_test_job",
-            config_json={"foo": "bar"},
-            version=1
+        await session.execute(
+            insert(JobConfig).values(
+                job_id="watcher_test_job",
+                config_json={"foo": "bar"},
+                version=1,
+            )
         )
-        await session.execute(stmt_job)
-        await session.execute(stmt_cfg)
         await session.commit()
 
-    # 2. 启动 Scheduler 和 Watcher
-    scheduler_manager.start()
-    await config_watcher.start()
+    app.scheduler.startup()
+    await app.watcher.start()
+    await app.watcher.reconcile_once()
 
-    # 3. 等待 Reconcile (poll_interval 默认可能较长，测试中为了快，可以 hack 一下 interval)
-    # 但由于我们用了 settings，为了测试稳定性，我们直接手动触发一次 reconcile
-    await config_watcher._reconcile()
+    scheduled = app.scheduler.raw_scheduler.get_job("watcher_test_job")
+    assert scheduled is not None
+    assert scheduled.name == "v1"
+    assert scheduled.executor == "io"
+    assert scheduled.misfire_grace_time == 17
+    assert scheduled.coalesce is False
+    assert scheduled.max_instances == 2
+    assert str(scheduled.trigger.timezone) == "UTC"
+    assert scheduled.trigger.jitter == 3
 
-    # 4. 验证
-    # 验证 Job 是否加载进 Scheduler
-    ap_job = scheduler_manager.raw_scheduler.get_job("watcher_test_job")
-    assert ap_job is not None
-    assert str(ap_job.trigger).startswith("interval")
-
-    # 验证 Config 是否加载进 Cache
-    from piko.core.cache import config_cache
-    cached = config_cache.get("watcher_test_job")
+    cached = app.config_cache.get("watcher_test_job")
     assert cached is not None
     assert cached.config_json == {"foo": "bar"}
 
-    # 5. 测试动态更新 (Disable Job)
-    async with db_infra._session_maker() as session:
-        # update enabled=False
-        from sqlalchemy import update
+    async with db_infra.get_session_context() as session:
         await session.execute(
             update(ScheduledJob)
             .where(ScheduledJob.job_id == "watcher_test_job")
@@ -76,13 +84,8 @@ async def test_watcher_reconcile():
         )
         await session.commit()
 
-    # 再次 reconcile
-    await config_watcher._reconcile()
+    await app.watcher.reconcile_once()
+    assert app.scheduler.raw_scheduler.get_job("watcher_test_job") is None
 
-    # 验证 Job 是否被移除
-    ap_job = scheduler_manager.raw_scheduler.get_job("watcher_test_job")
-    assert ap_job is None
-
-    # 清理
-    await config_watcher.stop()
-    scheduler_manager.shutdown()
+    await app.watcher.stop()
+    app.scheduler.shutdown()

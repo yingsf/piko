@@ -1,18 +1,24 @@
 import asyncio
 import datetime
 import os
+import secrets
 import socket
-from typing import cast
+from collections import abc
+from contextlib import AbstractAsyncContextManager
+from typing import Any, cast
 
-from sqlalchemy import update, select, CursorResult
+from sqlalchemy import CursorResult, func, select, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from piko.config import settings
-from piko.infra.db import SchedulerLeader, get_session, utcnow
+from piko.infra.db import SchedulerLeader, get_session_context
 from piko.infra.logging import get_logger
 from piko.infra.observability import LEADER_STATUS
 
 logger = get_logger(__name__)
+_jitter_source = secrets.SystemRandom()
+SessionFactory = abc.Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 class LeaderMutex:
@@ -25,7 +31,7 @@ class LeaderMutex:
     - 心跳续约：Leader 定期延长租约，失败则自动降级
 
     Attributes:
-        self._session_factory (callable): 数据库会话工厂函数（默认 get_session）
+        self._session_factory (callable): 数据库会话工厂函数（默认 get_session_context）
         self.owner_id (str): 当前节点标识，格式为 "hostname:pid"
         self.lease_name (str): 租约名称（通常为固定值，如 'scheduler-leader'）
         self.lease_seconds (int): 租约时长（秒），超过此时间未续约则被视为过期
@@ -44,11 +50,11 @@ class LeaderMutex:
         - 数据库连接故障会导致所有节点降级，需要配合数据库高可用方案
     """
 
-    def __init__(self, session_factory=get_session):
+    def __init__(self, session_factory: SessionFactory = get_session_context) -> None:
         """初始化 Leader 选举互斥锁
 
         Args:
-            session_factory (callable): 数据库会话工厂函数，默认为 get_session
+            session_factory (callable): 数据库会话工厂函数，默认为 get_session_context
         """
         self._session_factory = session_factory
         # 全局唯一的节点标识
@@ -61,6 +67,8 @@ class LeaderMutex:
         self._is_leader = False
         # 版本号快照，用于 CAS 校验
         self._current_version = 0
+        self._last_db_success_monotonic = 0.0
+        self._consecutive_db_failures = 0
 
     @property
     def is_leader(self) -> bool:
@@ -71,7 +79,7 @@ class LeaderMutex:
         """
         return self._is_leader
 
-    def _set_leader_status(self, is_leader: bool, version: int = 0):
+    def _set_leader_status(self, is_leader: bool, version: int = 0) -> None:
         """统一更新内存状态和监控指标（避免状态不一致）
 
         Args:
@@ -86,7 +94,15 @@ class LeaderMutex:
             # 仅在成为 Leader 时更新版本号快照
             self._current_version = version
 
-    async def ensure_seed(self):
+    async def _database_now(self, session: AsyncSession) -> datetime.datetime:
+        """读取数据库 UTC 时间，避免应用节点时钟参与租约判断。"""
+        result = await session.execute(text("SELECT UTC_TIMESTAMP(6)"))
+        value = result.scalar_one()
+        if not isinstance(value, datetime.datetime):
+            raise RuntimeError("database did not return a datetime for UTC_TIMESTAMP")
+        return value
+
+    async def ensure_seed(self) -> None:
         """初始化租约表的种子数据（幂等操作）
 
         在应用启动时调用，确保 SchedulerLeader 表中存在租约记录
@@ -110,14 +126,14 @@ class LeaderMutex:
                 # 初始占位符，真正的 owner 在首次抢占时设置
                 owner="init",
                 # 初始租约立即过期，允许任意节点抢占
-                lease_until=utcnow(),
+                lease_until=func.utc_timestamp(6),
                 # 初始版本号
-                version=0
+                version=0,
             )
             .on_duplicate_key_update(name=self.lease_name)
         )
         try:
-            async for session in self._session_factory():
+            async with self._session_factory() as session:
                 await session.execute(stmt)
                 await session.commit()
         except Exception as e:
@@ -135,27 +151,66 @@ class LeaderMutex:
         Returns:
             bool: True 表示成功抢占或续约，False 表示抢占失败（锁被其他节点持有）
         """
-        now = utcnow()
-        # 计算新的租约到期时间（当前时间 + 租约时长）
-        new_lease_until = now + datetime.timedelta(seconds=self.lease_seconds)
-
-        async for session in self._session_factory():
+        async with self._session_factory() as session:
             try:
+                now = await self._database_now(session)
+                new_lease_until = now + datetime.timedelta(seconds=self.lease_seconds)
                 # 委托核心抢占逻辑给辅助方法，降低复杂度
                 success = await self._attempt_acquire_logic(session, now, new_lease_until)
+                self._consecutive_db_failures = 0
+                self._last_db_success_monotonic = asyncio.get_running_loop().time()
                 if not success:
                     # 抢占失败，显式降级（虽然通常已经是 False，但保证幂等性）
                     self._set_leader_status(False)
                 return success
             except Exception as e:
                 logger.error("leader_acquire_error", error=str(e))
+                self._consecutive_db_failures += 1
+                elapsed = asyncio.get_running_loop().time() - self._last_db_success_monotonic
+                grace_s = float(getattr(settings, "leader_db_failure_grace_s", 5))
+                if self._is_leader and elapsed <= grace_s:
+                    logger.warning(
+                        "leader_db_status_uncertain",
+                        failures=self._consecutive_db_failures,
+                        grace_s=grace_s,
+                    )
+                    return True
                 self._set_leader_status(False)
                 return False
 
         # 理论上不会走到这里（async for 应至少执行一次），但为了满足类型检查
         return False
 
-    async def _attempt_acquire_logic(self, session, now, new_lease_until) -> bool:
+    async def verify_fencing_token(self) -> bool:
+        """使用数据库租约和版本号校验当前 Leader fencing token。"""
+        if not self.is_leader:
+            return False
+
+        async with self._session_factory() as session:
+            try:
+                stmt = select(SchedulerLeader.version).where(
+                    SchedulerLeader.name == self.lease_name,
+                    SchedulerLeader.owner == self.owner_id,
+                    SchedulerLeader.version == self._current_version,
+                    SchedulerLeader.lease_until > func.utc_timestamp(6),
+                )
+                result = await session.execute(stmt)
+                valid = result.scalar_one_or_none() is not None
+                if not valid:
+                    self._set_leader_status(False)
+                return valid
+            except Exception as error:
+                logger.warning("leader_fencing_check_failed", error=str(error))
+                return False
+
+        return False
+
+    async def _attempt_acquire_logic(
+        self,
+        session: AsyncSession,
+        now: datetime.datetime,
+        new_lease_until: datetime.datetime,
+    ) -> bool:
         """核心抢占逻辑：读取 -> 检查条件 -> 决定是否更新
 
         Args:
@@ -184,7 +239,13 @@ class LeaderMutex:
         # 锁未过期且不是我持有，抢占失败
         return False
 
-    async def _perform_cas_update(self, session, row, now, new_lease_until) -> bool:
+    async def _perform_cas_update(
+        self,
+        session: AsyncSession,
+        row: SchedulerLeader,
+        now: datetime.datetime,
+        new_lease_until: datetime.datetime,
+    ) -> bool:
         """执行 CAS (Compare-And-Swap) 更新抢占租约
 
         Args:
@@ -208,13 +269,15 @@ class LeaderMutex:
             - B 执行更新时 WHERE version=10 匹配失败，rowcount=0
             - B 的 CAS 失败，日志记录 "leader_cas_failed"
         """
+        old_version = row.version
+        new_version = old_version + 1
         # 构造 CAS 更新语句：WHERE version = old_version
         stmt_update = (
             update(SchedulerLeader)
             .where(
                 SchedulerLeader.name == self.lease_name,
                 # CAS 关键条件
-                SchedulerLeader.version == row.version
+                SchedulerLeader.version == old_version,
             )
             .values(
                 # 更新为当前节点
@@ -222,16 +285,16 @@ class LeaderMutex:
                 # 延长租约
                 lease_until=new_lease_until,
                 # 版本号递增，防止 ABA 问题
-                version=row.version + 1,
+                version=new_version,
                 # 更新时间戳
-                updated_at=now
+                updated_at=now,
             )
         )
         res = await session.execute(stmt_update)
         await session.commit()
 
-        # 使用 cast 显式转换类型，消除 Mypy 对 rowcount 的未解析警告
-        row_count = cast(CursorResult, res).rowcount
+        # 数据库执行结果的 rowcount 仅在游标结果上可用。
+        row_count = cast(CursorResult[Any], res).rowcount
 
         if row_count > 0:
             # CAS 成功：我成功抢占或续约了租约
@@ -239,7 +302,7 @@ class LeaderMutex:
                 # 首次成为 Leader，记录日志（续约时不重复记录）
                 logger.info("leader_acquired", owner=self.owner_id)
             # 更新内存状态和监控指标
-            self._set_leader_status(True, row.version + 1)
+            self._set_leader_status(True, new_version)
             return True
         else:
             # CAS 失败：被其他节点并发抢占（版本号不匹配）
@@ -274,14 +337,10 @@ class LeaderMutex:
             幂等性设计：
             - 非 Leader 调用时直接返回，不执行数据库操作
             - WHERE 条件包含 owner 校验，防止误释放其他节点的锁
-            - 异常时静默失败（使用 pass），因为释放失败不影响最终一致性
-              （租约自然过期后其他节点可以抢占）
+            - 释放异常会记录告警，但仍清理本地状态
+            - 数据库中的租约会自然过期，其他节点随后可以抢占
         """
-        if not self._is_leader:
-            # 非 Leader 无需释放
-            return
-
-        async for session in self._session_factory():
+        async with self._session_factory() as session:
             try:
                 # 将租约到期时间设为当前时间，使其立即过期
                 stmt = (
@@ -289,16 +348,18 @@ class LeaderMutex:
                     .where(
                         SchedulerLeader.name == self.lease_name,
                         # 仅释放自己持有的锁
-                        SchedulerLeader.owner == self.owner_id
+                        SchedulerLeader.owner == self.owner_id,
                     )
-                    .values(lease_until=utcnow())
+                    .values(
+                        lease_until=func.utc_timestamp(6),
+                        updated_at=func.utc_timestamp(6),
+                    )
                 )
                 await session.execute(stmt)
                 await session.commit()
                 logger.info("leader_released", owner=self.owner_id)
-            except Exception:
-                # 释放失败不中断流程（租约会自然过期）
-                pass
+            except Exception as error:
+                logger.warning("leader_release_error", owner=self.owner_id, error=str(error))
             finally:
                 # 无论数据库操作是否成功，都更新内存状态和监控指标
                 self._set_leader_status(False)
@@ -356,9 +417,9 @@ class LeaderWatchdog:
         """
         self._mutex = mutex
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
-    async def start(self):
+    async def start(self) -> None:
         """启动后台心跳任务
 
         创建一个 asyncio.Task 运行 _loop 方法，实现非阻塞的后台心跳
@@ -373,7 +434,7 @@ class LeaderWatchdog:
         await asyncio.sleep(0)
         logger.info("leader_watchdog_started")
 
-    async def stop(self):
+    async def stop(self) -> None:
         """停止后台心跳任务（优雅关闭）"""
         self._running = False
         if self._task:
@@ -381,7 +442,7 @@ class LeaderWatchdog:
             await asyncio.gather(self._task, return_exceptions=True)
         logger.info("leader_watchdog_stopped")
 
-    async def _loop(self):
+    async def _loop(self) -> None:
         """心跳循环的核心逻辑（后台持续运行）
 
         根据当前节点角色执行不同操作：
@@ -389,6 +450,13 @@ class LeaderWatchdog:
         - Follower：调用 try_acquire 尝试抢占
         """
         while self._running:
+            # 首次续租也等待一个完整周期，避免启动阶段立即递增 fencing token，
+            # 让刚启动的 Runner 使用到过期的内存版本快照。
+            jitter_limit = float(getattr(settings, "leader_watchdog_jitter_s", 1))
+            jitter = _jitter_source.uniform(-jitter_limit, jitter_limit)
+            await asyncio.sleep(max(0.1, settings.leader_renew_interval_s + jitter))
+            if not self._running:
+                break
             try:
                 if self._mutex.is_leader:
                     # Leader 节点：执行续约
@@ -403,9 +471,6 @@ class LeaderWatchdog:
             except Exception as e:
                 # 捕获所有异常，避免循环中断（例如数据库连接断开）
                 logger.error("leader_watchdog_error", error=str(e))
-
-            # 休眠指定间隔后继续下一轮心跳
-            await asyncio.sleep(settings.leader_renew_interval_s)
 
 
 _leader_watchdog: LeaderWatchdog | None = None

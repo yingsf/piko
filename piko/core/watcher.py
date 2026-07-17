@@ -1,23 +1,31 @@
 import asyncio
 import json
-import random
+import math
+import secrets
 from datetime import datetime, timezone
-from typing import Dict
+from typing import TypeAlias, cast
 
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from piko.config import settings
 from piko.core.cache import ConfigCache, CachedConfig
 from piko.core.registry import JobRegistry
 from piko.core.runner import JobRunner
 from piko.core.scheduler import SchedulerManager
-from piko.infra.db import get_session, ScheduledJob, JobConfig
+from piko.infra.db import get_session_context, JobConfig, ScheduledJob
+from piko.infra.leader import get_leader_mutex
 from piko.infra.logging import get_logger
+from piko.infra.observability import CONFIG_RECONCILE_TOTAL
 
 logger = get_logger(__name__)
+_jitter_source = secrets.SystemRandom()
+
+Trigger: TypeAlias = CronTrigger | DateTrigger | IntervalTrigger
+SUPPORTED_EXECUTORS = frozenset({"default", "cpu", "io"})
 
 
 class ConfigWatcher:
@@ -37,12 +45,12 @@ class ConfigWatcher:
     """
 
     def __init__(
-            self,
-            scheduler_manager: SchedulerManager,
-            config_cache: ConfigCache,
-            registry: JobRegistry,
-            runner: JobRunner
-    ):
+        self,
+        scheduler_manager: SchedulerManager,
+        config_cache: ConfigCache,
+        registry: JobRegistry,
+        runner: JobRunner,
+    ) -> None:
         """初始化配置监视器
 
         Args:
@@ -57,12 +65,16 @@ class ConfigWatcher:
         self._runner = runner
 
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
-        # ✅ [新增] 动态轮询间隔，初始值使用配置文件默认值
+        # 动态轮询间隔从静态配置初始化，并在后续协调中受控更新。
         self._dynamic_interval = settings.poll_interval_s
+        self._sync_initialized = False
+        self._last_sync_at: datetime | None = None
+        self._known_jobs: dict[str, ScheduledJob] = {}
+        self._known_configs: dict[str, JobConfig] = {}
 
-    async def start(self):
+    async def start(self) -> None:
         """启动配置监视器的协调循环"""
         if self._running:
             return
@@ -72,7 +84,7 @@ class ConfigWatcher:
         await asyncio.sleep(0)
         logger.info("config_watcher_started", interval=self._dynamic_interval)
 
-    async def stop(self):
+    async def stop(self) -> None:
         """停止配置监视器的协调循环"""
         self._running = False
         if self._task:
@@ -80,7 +92,17 @@ class ConfigWatcher:
             await asyncio.gather(self._task, return_exceptions=True)
         logger.info("config_watcher_stopped")
 
-    async def _watch_loop(self):
+    @property
+    def is_running(self) -> bool:
+        """返回配置协调循环是否正在运行。"""
+        return self._running
+
+    @property
+    def dynamic_interval(self) -> float:
+        """返回当前生效的配置轮询间隔。"""
+        return float(self._dynamic_interval)
+
+    async def _watch_loop(self) -> None:
         """协调循环的主逻辑"""
         while self._running:
             try:
@@ -89,60 +111,114 @@ class ConfigWatcher:
                 raise
             except Exception as e:
                 logger.error("watcher_reconcile_error", error=str(e))
+                CONFIG_RECONCILE_TOTAL.labels(result="failed").inc()
                 # 异常时退避到默认间隔，防止数据库故障导致死循环风暴
                 await asyncio.sleep(settings.poll_interval_s)
                 continue
 
-            # ✅ [关键] 使用动态更新的间隔时间
-            jitter = random.uniform(-settings.poll_jitter_s, settings.poll_jitter_s)
+            # 使用最后一次通过校验的动态间隔，避免读取失败时中断协调循环。
+            jitter = _jitter_source.uniform(-settings.poll_jitter_s, settings.poll_jitter_s)
             sleep_time = max(1, self._dynamic_interval + jitter)
             await asyncio.sleep(sleep_time)
 
-    async def _reconcile(self):
+    async def _reconcile(self) -> None:
         """执行一次协调操作（同步数据库状态到内存和调度器）"""
-        db_jobs: Dict[str, ScheduledJob] = {}
-        db_configs: Dict[str, JobConfig] = {}
+        if settings.leader_enabled and not get_leader_mutex().is_leader:
+            self._clear_scheduler_jobs()
+            CONFIG_RECONCILE_TOTAL.labels(result="no_change").inc()
+            return
 
-        async for session in get_session():
-            # 1. 读取业务任务
-            stmt_job = select(ScheduledJob).where(ScheduledJob.enabled.is_(True))
+        async with get_session_context() as session:
+            sync_anchor = await self._database_now(session)
+            if self._sync_initialized and self._last_sync_at is not None:
+                job_filter = ScheduledJob.updated_at >= self._last_sync_at
+                config_filter = JobConfig.updated_at >= self._last_sync_at
+                stmt_job = select(ScheduledJob).where(job_filter)
+                stmt_cfg = select(JobConfig).where(config_filter)
+            else:
+                stmt_job = select(ScheduledJob)
+                stmt_cfg = select(JobConfig)
+
+            # 1. 增量读取任务调度与配置；首次协调执行全量初始化。
             result_job = await session.execute(stmt_job)
-
             for row in result_job.scalars():
-                if self._registry.get_job(row.job_id):
-                    db_jobs[row.job_id] = row
+                if row.enabled and self._registry.get_job(row.job_id):
+                    self._known_jobs[row.job_id] = row
+                elif not row.enabled:
+                    self._known_jobs.pop(row.job_id, None)
                 else:
                     logger.warning("watcher_skip_unregistered", job_id=row.job_id)
 
-            stmt_cfg = select(JobConfig)
             result_cfg = await session.execute(stmt_cfg)
             for row in result_cfg.scalars():
-                db_configs[row.job_id] = row
+                self._known_configs[row.job_id] = row
 
-            # 2. ✅ [新增] 读取系统级动态配置
-            try:
-                sys_stmt = text("SELECT config_json FROM job_config WHERE job_id = :sys_id")
-                sys_res = await session.execute(sys_stmt, {"sys_id": "piko_system_settings"})
-                sys_row = sys_res.fetchone()
+            self._last_sync_at = sync_anchor
+            self._sync_initialized = True
 
-                if sys_row:
-                    config_data = sys_row[0]
-                    if isinstance(config_data, (str, bytes)):
-                        config_data = json.loads(config_data)
+        self._sync_system_config()
+        self._sync_config_cache(self._known_configs)
+        self._config_cache.prune(set(self._known_configs.keys()))
+        self._sync_scheduler(self._known_jobs)
+        CONFIG_RECONCILE_TOTAL.labels(result="success").inc()
 
-                    new_interval = config_data.get("poll_interval_s")
-                    if new_interval and isinstance(new_interval, (int, float)):
-                        if new_interval != self._dynamic_interval:
-                            logger.info(f"⚙️ [System] 轮询间隔已变更为: {new_interval}秒")
-                            self._dynamic_interval = new_interval
-            except Exception as e:
-                logger.warning("system_config_load_failed", error=str(e))
+    async def _database_now(self, session: AsyncSession) -> datetime:
+        """读取数据库时间作为增量同步边界。"""
+        result = await session.execute(text("SELECT UTC_TIMESTAMP(6)"))
+        value = result.scalar_one()
+        if not isinstance(value, datetime):
+            raise RuntimeError("database did not return a datetime for UTC_TIMESTAMP")
+        return value
 
-        self._sync_config_cache(db_configs)
-        self._config_cache.prune(set(db_configs.keys()))
-        self._sync_scheduler(db_jobs)
+    def _sync_system_config(self) -> None:
+        """应用系统级动态配置中唯一受支持的轮询间隔。"""
+        row = self._known_configs.get("piko_system_settings")
+        if row is None:
+            return
+        self.apply_system_config(row.config_json)
 
-    def _sync_config_cache(self, db_configs: Dict[str, JobConfig]):
+    def apply_system_config(self, config_data: object) -> None:
+        """校验并应用受支持的系统级动态配置。"""
+        if isinstance(config_data, (str, bytes)):
+            config_data = json.loads(config_data)
+        if not isinstance(config_data, dict):
+            logger.warning("system_config_invalid", field="poll_interval_s")
+            return
+
+        typed_config = cast(dict[str, object], config_data)
+        new_interval = typed_config.get("poll_interval_s")
+        if (
+            isinstance(new_interval, (int, float))
+            and not isinstance(new_interval, bool)
+            and math.isfinite(new_interval)
+            and 1 <= new_interval <= 3600
+        ):
+            if new_interval != self._dynamic_interval:
+                logger.info("system_poll_interval_changed", interval_s=new_interval)
+                self._dynamic_interval = float(new_interval)
+        elif new_interval is not None:
+            logger.warning("system_config_invalid", field="poll_interval_s")
+
+    def _clear_scheduler_jobs(self) -> None:
+        """Follower 失去调度资格时清除内存定时器。"""
+        raw_scheduler = self._scheduler_manager.raw_scheduler
+        for job in raw_scheduler.get_jobs():
+            raw_scheduler.remove_job(job.id)
+        if raw_scheduler.get_jobs():
+            logger.warning("watcher_follower_scheduler_clear_incomplete")
+
+    async def reconcile_once(self) -> None:
+        """执行一轮配置协调
+
+        该方法用于需要显式推进配置状态的管理操作。
+        """
+        try:
+            await self._reconcile()
+        except Exception:
+            CONFIG_RECONCILE_TOTAL.labels(result="failed").inc()
+            raise
+
+    def _sync_config_cache(self, db_configs: dict[str, JobConfig]) -> None:
         """更新内存中的配置缓存"""
         for job_id, row in db_configs.items():
             now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -151,13 +227,11 @@ class ConfigWatcher:
                 continue
 
             cached = CachedConfig(
-                config_json=row.config_json,
-                version=row.version,
-                schema_version=row.schema_version
+                config_json=row.config_json, version=row.version, schema_version=row.schema_version
             )
             self._config_cache.set(job_id, cached)
 
-    def _sync_scheduler(self, db_jobs: Dict[str, ScheduledJob]):
+    def _sync_scheduler(self, db_jobs: dict[str, ScheduledJob]) -> None:
         """同步任务到 APScheduler（增删改）"""
         raw_scheduler = self._scheduler_manager.raw_scheduler
 
@@ -179,17 +253,25 @@ class ConfigWatcher:
             existing_job = raw_scheduler.get_job(job_id)
             current_version_tag = f"v{row.version}"
 
-            if existing_job.name != current_version_tag:
+            if existing_job is not None and existing_job.name != current_version_tag:
                 new_trigger = self._build_trigger(row)
-                if new_trigger:
+                job_options = self._job_options(row)
+                if new_trigger and job_options is not None:
                     raw_scheduler.reschedule_job(job_id, trigger=new_trigger)
-                    raw_scheduler.modify_job(job_id, name=current_version_tag)
+                    raw_scheduler.modify_job(
+                        job_id,
+                        name=current_version_tag,
+                        **job_options,
+                    )
                     logger.info("watcher_job_rescheduled", job_id=job_id, version=row.version)
 
-    def _add_job_to_scheduler(self, row: ScheduledJob):
+    def _add_job_to_scheduler(self, row: ScheduledJob) -> None:
         """添加任务到 APScheduler"""
         trigger = self._build_trigger(row)
         if not trigger:
+            return
+        job_options = self._job_options(row)
+        if job_options is None:
             return
 
         self._scheduler_manager.raw_scheduler.add_job(
@@ -197,24 +279,48 @@ class ConfigWatcher:
             trigger=trigger,
             id=row.job_id,
             args=[row.job_id],
-            name=f"v{row.version}"
+            name=f"v{row.version}",
+            **job_options,
         )
 
         logger.info("watcher_job_added", job_id=row.job_id, trigger=str(trigger))
 
-    def _build_trigger(self, row: ScheduledJob):
+    def _build_trigger(self, row: ScheduledJob) -> Trigger | None:
         """构建 APScheduler 触发器"""
         try:
-            kwargs = json.loads(row.schedule_expr)
-            if row.schedule_type == 'cron':
-                return CronTrigger(**kwargs, timezone=settings.timezone)
-            elif row.schedule_type == 'interval':
-                return IntervalTrigger(**kwargs, timezone=settings.timezone)
-            elif row.schedule_type == 'date':
-                return DateTrigger(**kwargs, timezone=settings.timezone)
+            raw_kwargs = json.loads(row.schedule_expr)
+            if not isinstance(raw_kwargs, dict):
+                raise ValueError("schedule_expr must be a JSON object")
+            kwargs = cast(dict[str, object], raw_kwargs)
+            kwargs["timezone"] = row.timezone
+            if row.schedule_type != "date":
+                kwargs["jitter"] = row.jitter_s or None
+            elif row.jitter_s:
+                raise ValueError("date trigger does not support jitter_s")
+            if row.schedule_type == "cron":
+                return CronTrigger(**kwargs)
+            elif row.schedule_type == "interval":
+                return IntervalTrigger(**kwargs)
+            elif row.schedule_type == "date":
+                return DateTrigger(**kwargs)
             else:
                 logger.error("unknown_schedule_type", job_id=row.job_id, type=row.schedule_type)
                 return None
         except Exception as e:
             logger.error("trigger_build_failed", job_id=row.job_id, error=str(e))
             return None
+
+    def _job_options(self, row: ScheduledJob) -> dict[str, object] | None:
+        """校验并生成 APScheduler 的逐任务参数"""
+        if row.executor not in SUPPORTED_EXECUTORS:
+            logger.error("unsupported_job_executor", job_id=row.job_id, executor=row.executor)
+            return None
+        if row.misfire_grace_s < 0 or row.max_instances < 1 or row.jitter_s < 0:
+            logger.error("invalid_job_scheduler_options", job_id=row.job_id)
+            return None
+        return {
+            "executor": row.executor,
+            "misfire_grace_time": row.misfire_grace_s,
+            "coalesce": row.coalesce,
+            "max_instances": row.max_instances,
+        }

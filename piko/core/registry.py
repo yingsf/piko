@@ -21,6 +21,7 @@ class JobOptions(TypedDict):
         backfill_policy (BackfillPolicy): 补跑策略
         resources (Dict[str, Type[Resource]]): 资源依赖声明
     """
+
     stateful: bool
     backfill_policy: BackfillPolicy
     resources: Dict[str, Type[Resource]]
@@ -30,7 +31,7 @@ class JobRegistry:
     """任务注册中心（白名单模式）
 
     本类负责管理所有已注册的任务（job），提供装饰器语法进行任务注册，以及运行时的任务查询、配置验证等功能
-    本类由 PikoApp 实例化并持有，不再作为全局单例存在
+    本类由 PikoApp 实例化并持有，每个应用实例维护独立注册状态
 
     Attributes:
         _jobs (Dict[str, JobHandler]): job_id -> 任务处理函数的映射
@@ -38,20 +39,20 @@ class JobRegistry:
         _options (Dict[str, JobOptions]): job_id -> 任务元数据的映射
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化注册中心"""
         self._jobs: Dict[str, JobHandler] = {}
         self._schemas: Dict[str, Type[BaseModel]] = {}
         self._options: Dict[str, JobOptions] = {}
 
     def register(
-            self,
-            job_id: str,
-            schema: Type[BaseModel] | None = None,
-            stateful: bool = False,
-            backfill_policy: BackfillPolicy = BackfillPolicy.SKIP,
-            resources: Dict[str, Type[Resource]] | None = None
-    ):
+        self,
+        job_id: str,
+        schema: object | None = None,
+        stateful: bool = False,
+        backfill_policy: BackfillPolicy = BackfillPolicy.SKIP,
+        resources: Dict[str, Type[Resource]] | None = None,
+    ) -> Callable[[JobHandler], JobHandler]:
         """装饰器工厂：将函数注册为 Piko 任务
 
         Args:
@@ -65,31 +66,34 @@ class JobRegistry:
             Callable: 装饰器函数
         """
 
-        def wrapper(func: JobHandler):
+        def wrapper(func: JobHandler) -> JobHandler:
             if not inspect.iscoroutinefunction(func):
                 raise ValueError(f"Job handler '{func.__name__}' must be an async function.")
 
+            validated_schema: Type[BaseModel] | None = None
+            if schema is not None:
+                if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+                    raise ValueError(f"Schema for '{job_id}' must be a Pydantic BaseModel.")
+                validated_schema = schema
+
             if job_id in self._jobs:
-                logger.warning("registry_overwrite", job_id=job_id, old=self._jobs[job_id], new=func)
+                logger.warning(
+                    "registry_overwrite", job_id=job_id, old=self._jobs[job_id], new=func
+                )
 
             self._jobs[job_id] = func
             self._options[job_id] = {
                 "stateful": stateful,
                 "backfill_policy": backfill_policy,
-                "resources": resources or {}
+                "resources": resources or {},
             }
 
-            logger.info(
-                "job_registered",
-                job_id=job_id,
-                handler=func.__name__,
-                stateful=stateful
-            )
+            if validated_schema is None:
+                self._schemas.pop(job_id, None)
+            else:
+                self._schemas[job_id] = validated_schema
 
-            if schema:
-                if not issubclass(schema, BaseModel):
-                    raise ValueError(f"Schema for '{job_id}' must be a Pydantic BaseModel.")
-                self._schemas[job_id] = schema
+            logger.info("job_registered", job_id=job_id, handler=func.__name__, stateful=stateful)
 
             return func
 
@@ -102,15 +106,12 @@ class JobRegistry:
     def get_options(self, job_id: str) -> JobOptions:
         """根据 job_id 获取任务元数据"""
         return self._options.get(
-            job_id,
-            {
-                "stateful": False,
-                "backfill_policy": BackfillPolicy.SKIP,
-                "resources": {}
-            }
+            job_id, {"stateful": False, "backfill_policy": BackfillPolicy.SKIP, "resources": {}}
         )
 
-    def validate_config(self, job_id: str, config_data: dict) -> BaseModel | dict:
+    def validate_config(
+        self, job_id: str, config_data: dict[str, object]
+    ) -> BaseModel | dict[str, object]:
         """验证并转换任务的配置数据"""
         schema = self._schemas.get(job_id)
         if not schema:

@@ -1,6 +1,7 @@
 import datetime
 
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.job import Job
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -45,7 +46,7 @@ class PikoExecutor(AsyncIOExecutor):
         - 时区转换统一为 UTC Naive，与 Piko 的数据库约定一致
     """
 
-    def _do_submit_job(self, job, run_times):
+    def _do_submit_job(self, job: Job, run_times: list[datetime.datetime]) -> None:
         """提交任务到事件循环前的预处理（注入 scheduled_time）
 
         Args:
@@ -103,34 +104,32 @@ class SchedulerManager:
         ```
 
     Note:
-        - 在 Piko 2.0 中，本类由 PikoApp 实例化，不再作为全局单例
+        - 本类由 PikoApp 实例化，并通过依赖注入传递给 ConfigWatcher
         - 调度器启动后会自动创建后台线程（事件循环），无需手动管理
         - 优雅关闭时（`shutdown(wait=True)`）会等待在途任务执行完毕
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化调度器管理器
 
         配置并创建 APScheduler 实例，但不启动（需手动调用 `startup`）
         """
         # 配置任务存储：使用纯内存存储，重启即空
-        jobstores = {
-            "default": MemoryJobStore()
-        }
+        jobstores: dict[str, object] = {"default": MemoryJobStore()}
 
         # 配置任务执行器：使用自定义 PikoExecutor
-        executors = {
-            "default": PikoExecutor()
+        executors: dict[str, object] = {
+            "default": PikoExecutor(),
+            "cpu": PikoExecutor(),
+            "io": PikoExecutor(),
         }
 
         # 配置任务的默认参数
-        job_defaults = {
+        job_defaults: dict[str, object] = {
             # coalesce=True: 积压合并
             "coalesce": True,
-
             # max_instances=1: 默认单实例
-            "max_instances": 1,
-
+            "max_instances": settings.ap_max_instances_default,
             # misfire_grace_time: Misfire 宽限时间（单位：秒）
             "misfire_grace_time": settings.ap_misfire_grace_s_default,
         }
@@ -143,7 +142,7 @@ class SchedulerManager:
             timezone=settings.timezone,
         )
 
-    def startup(self):
+    def startup(self) -> None:
         """启动调度器
 
         Note:
@@ -156,7 +155,7 @@ class SchedulerManager:
             self._scheduler.start()
             logger.info("scheduler_started")
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """优雅关闭调度器
 
         停止 APScheduler 的事件循环，等待所有在途任务执行完毕
@@ -170,6 +169,11 @@ class SchedulerManager:
         if self._scheduler.running:
             self._scheduler.shutdown(wait=True)
             logger.info("scheduler_shutdown")
+
+    @property
+    def is_running(self) -> bool:
+        """返回 APScheduler 是否正在运行。"""
+        return bool(self._scheduler.running)
 
     @property
     def raw_scheduler(self) -> AsyncIOScheduler:

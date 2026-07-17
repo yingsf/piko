@@ -1,41 +1,79 @@
-import pytest
-import os
 import asyncio
-from piko.compute.manager import cpu_manager
+import os
+import time
+
+import pytest
+
+from piko import PikoApp
 
 
-# 定义一个模块级函数 (普通 pickle 也能处理)
-def cpu_heavy_task(x):
-    return x * x, os.getpid()
+def cpu_heavy_task(value: int) -> tuple[int, int]:
+    """返回输入平方和执行进程号"""
+    return value * value, os.getpid()
+
+
+def increment(value: int) -> int:
+    """递增一个整数"""
+    return value + 1
+
+
+def fail_on_three(value: int) -> int:
+    """在指定输入上抛出异常"""
+    if value == 3:
+        raise ValueError("three is invalid")
+    return value
+
+
+def delayed_increment(value: int) -> int:
+    """以反向延迟模拟乱序完成的计算任务"""
+    time.sleep((4 - value) * 0.02)
+    return value + 1
+
+
+def slow_increment(value: int) -> int:
+    """以较长延迟模拟可取消的计算任务"""
+    time.sleep(0.5)
+    return value + 1
 
 
 @pytest.mark.asyncio
-async def test_cpu_manager():
-    # 1. Start
-    cpu_manager.start()
+async def test_cpu_manager() -> None:
+    """验证应用实例持有的 CPU 计算池"""
+    app = PikoApp(name="compute-test")
+    app.cpu_manager.startup()
     main_pid = os.getpid()
 
     try:
-        # 2. Test Single Submit
-        result, worker_pid = await cpu_manager.submit(cpu_heavy_task, 10)
+        result, worker_pid = await app.cpu_manager.submit(cpu_heavy_task, 10)
         assert result == 100
-        assert worker_pid != main_pid  # 必须在不同进程执行
+        assert worker_pid != main_pid
 
-        # 3. Test Cloudpickle (Closure / Lambda)
-        # 这是一个普通 pickle 无法处理的场景：闭包
         factor = 5
 
-        def closure_task(x):
-            return x * factor, os.getpid()
+        def closure_task(value: int) -> tuple[int, int]:
+            return value * factor, os.getpid()
 
-        result, worker_pid = await cpu_manager.submit(closure_task, 10)
+        result, worker_pid = await app.cpu_manager.submit(closure_task, 10)
         assert result == 50
         assert worker_pid != main_pid
 
-        # 4. Test Map Reduce
-        items = list(range(10))
-        results = await cpu_manager.map_reduce(lambda x: x + 1, items, chunk_size=2)
-        assert results == [x + 1 for x in items]
+        results = await app.cpu_manager.map_reduce(increment, range(10), concurrency=2)
+        assert results == list(range(1, 11))
 
+        ordered_results = await app.cpu_manager.map_reduce(
+            delayed_increment, range(4), concurrency=4
+        )
+        assert ordered_results == list(range(1, 5))
+
+        with pytest.raises(ValueError, match="three is invalid"):
+            await app.cpu_manager.map_reduce(fail_on_three, range(5), concurrency=2)
+
+        cancelled = asyncio.create_task(
+            app.cpu_manager.map_reduce(slow_increment, range(4), concurrency=2)
+        )
+        await asyncio.sleep(0.05)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
     finally:
-        cpu_manager.shutdown()
+        app.cpu_manager.shutdown()

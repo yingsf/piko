@@ -5,13 +5,6 @@
 version = "0.0.0-dev"
 
 # ============================================================================
-# Startup Strategy - 启动策略
-# ============================================================================
-# startup_mode 控制服务启动时的容错行为：
-#   - "fail_closed": 严格模式，任何配置或依赖检查失败都立即终止启动（生产推荐）
-#   - "fail_open_snapshot": 宽容模式，允许使用快照数据降级启动（仅用于开发/测试）
-startup_mode = "fail_closed"
-
 # debug 模式会启用更详细的日志和调试端点，生产环境必须设为 false
 debug = false
 
@@ -22,11 +15,11 @@ debug = false
 # 这样用户如果没配置环境变量，启动时会看到友好的 FATAL ERROR 提示
 #
 # ⚠️ 必须使用异步驱动！
-# 推荐使用 mysql+asyncmy (速度最快) 或 mysql+aiomysql (兼容性好)
+# 推荐使用 mysql+aiomysql (异步兼容性好)
 # ❌ 不要使用 pymysql (这是同步驱动，会阻塞 Event Loop)
 #
 # 格式示例:
-#   "mysql+asyncmy://user:pass@host:port/dbname?charset=utf8mb4"
+#   "mysql+aiomysql://user:pass@host:port/dbname?charset=utf8mb4"
 mysql_dsn = ""
 
 # mysql_pool_size: 连接池初始大小，影响并发能力
@@ -45,18 +38,13 @@ mysql_pool_recycle_s = 3600
 # ============================================================================
 # Scheduler Tuning - 调度器调优参数
 # ============================================================================
-# poll_interval_s: 主轮询间隔（秒），这是"默认"间隔。
-# 系统启动后，ConfigWatcher 会优先读取数据库中的 piko_system_settings 配置。
-# 如果数据库没配置，才使用此值。
+# poll_interval_s: 主轮询间隔（秒），启动静态默认值。
+# 运行时仅允许通过 piko_system_settings 的 poll_interval_s 在 1~3600 秒内覆盖。
 poll_interval_s = 10
 
 # poll_jitter_s: 轮询抖动时间（秒）
 # 随机化轮询时刻，避免多实例在同一时刻同时轮询造成数据库压力峰值
 poll_jitter_s = 2
-
-# debounce_s: 防抖窗口（秒）
-# 在此时间窗口内重复触发的相同任务会被合并，减少无效调度
-debounce_s = 2
 
 # timezone: 时区设置
 # 影响 cron 表达式的解析和任务触发时间计算，必须与业务时区一致
@@ -91,6 +79,12 @@ leader_lease_s = 30
 # 这样即使某次续租失败，仍有时间在租约到期前重试
 leader_renew_interval_s = 10
 
+# leader_watchdog_jitter_s: 看门狗每次续租/抢占间隔的随机抖动上限（秒）
+leader_watchdog_jitter_s = 1
+
+# leader_db_failure_grace_s: 数据库短暂不可用时保留已知 Leader 状态的最长时间（秒）
+leader_db_failure_grace_s = 5
+
 # ============================================================================
 # Concurrency & Compute - 并发与计算资源
 # ============================================================================
@@ -102,12 +96,33 @@ cpu_workers = 0
 # 限制单个任务可使用的最大线程数，防止某个任务耗尽所有资源
 per_job_cpu_max = 8
 
+# job_lock_lease_s: 单次任务锁的租约时长（秒）
+job_lock_lease_s = 300
+
+# job_lock_heartbeat_s: 任务锁续租间隔（秒）
+job_lock_heartbeat_s = 30
+
+# job_run_orphan_timeout_s: RUNNING 记录被视为孤儿前的最长时长（秒）
+job_run_orphan_timeout_s = 900
+
+# job_handler_timeout_s: 单次任务 handler 的最长执行时间（秒）
+job_handler_timeout_s = 300
+
+# shutdown_timeout_s: 应用整体优雅停机预算（秒）
+shutdown_timeout_s = 30
+
 # ============================================================================
 # Persistence - 持久化与缓冲配置
 # ============================================================================
 # persist_queue_max: 持久化队列最大长度
 # 控制内存中待持久化对象的最大数量，防止内存溢出
 persist_queue_max = 200
+
+# persist_batch_size: 单次 Sink 写入的最大意图数量
+persist_batch_size = 100
+
+# persist_batch_timeout_s: 收集一个批次时等待后续意图的最长时间（秒）
+persist_batch_timeout_s = 0.5
 
 # persist_flush_timeout_s: 强制刷盘超时（秒）
 # 即使队列未满，也会在此时间后强制写入，平衡数据丢失风险与 I/O 效率
@@ -125,9 +140,9 @@ persist_disk_fallback_path = "/tmp/piko_fallback.bin"
 # 生产环境强烈建议启用，用于监控调度器健康状况
 metrics_enabled = true
 
-# health_port: 健康检查和指标暴露端口
-# K8s/Docker 可通过此端口进行 liveness/readiness probe
-health_port = 8080
+# api_docs_enabled: 是否暴露 FastAPI 文档和 OpenAPI schema
+# 生产环境默认关闭；如需临时启用，应通过私网或认证代理访问
+api_docs_enabled = false
 
 # log_level: 日志级别
 # 可选: DEBUG, INFO, WARNING, ERROR, CRITICAL

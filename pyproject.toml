@@ -1,6 +1,6 @@
 [project]
 name = "piko-cucc"
-version = "0.1.8"
+version = "0.1.9"
 description = "Data-Oriented Async Task Orchestrator"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,20 +18,20 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 dependencies = [
-    "aiofiles>=25.1.0",
-    "apscheduler>=3.11.2",
-    "asyncmy>=0.2.10",
-    "cloudpickle>=3.1.2",
-    "croniter>=6.0.0",
-    "cryptography>=46.0.3",
-    "dynaconf>=3.2.12",
-    "fastapi>=0.128.0",
-    "greenlet>=3.0.0",
-    "prometheus-client>=0.23.1",
-    "pydantic>=2.12.5",
-    "sqlalchemy>=2.0.45",
-    "structlog>=25.5.0",
-    "uvicorn>=0.40.0",
+    "aiofiles>=25.1.0,<26",
+    "alembic>=1.18.5,<2",
+    "apscheduler>=3.11.3,<4",
+    "aiomysql>=0.3.2,<0.4",
+    "cloudpickle>=3.1.2,<4",
+    "croniter>=6.2.4,<7",
+    "dynaconf>=3.3.2,<4",
+    "fastapi>=0.139.2,<1",
+    "greenlet>=3.5.3,<4",
+    "prometheus-client>=0.25.0,<1",
+    "pydantic>=2.13.4,<3",
+    "sqlalchemy>=2.0.51,<2.1",
+    "structlog>=26.1.0,<27",
+    "uvicorn>=0.51.0,<1",
 ]
 
 [project.urls]
@@ -48,18 +48,28 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["piko"]
 
+[tool.hatch.build.targets.sdist]
+include = ["piko", "migrations", "alembic.ini", "README.md", "LICENSE", "pyproject.toml"]
+
 # --- 工具配置 ---
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
-[tool.mypy]
-python_version = "3.12"
-strict = true
-ignore_missing_imports = true
-plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+[dependency-groups]
+dev = [
+    "bandit>=1.9.4,<2",
+    "build>=1.5.0,<2",
+    "pip-audit>=2.10.1,<3",
+    "pyright>=1.1.411,<2",
+    "pytest>=9.1.1,<10",
+    "pytest-asyncio>=1.4.0,<2",
+    "ruff>=0.15.22,<0.16",
+    "twine>=6.2.0,<7",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = ["integration: 需要显式隔离 MySQL 测试库的集成测试"]

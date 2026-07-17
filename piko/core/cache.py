@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from typing import Dict, Optional, Set
 
@@ -46,9 +47,14 @@ class CachedConfig:
         - 版本号的设计遵循"乐观锁"模式：假设冲突很少，通过版本号检测冲突，
           而非使用悲观锁（加锁）阻止并发访问
     """
-    config_json: dict
+
+    config_json: dict[str, object]
     version: int
     schema_version: int
+
+    def __post_init__(self) -> None:
+        """复制配置内容，避免实例外部继续持有可变嵌套对象。"""
+        object.__setattr__(self, "config_json", copy.deepcopy(self.config_json))
 
 
 class ConfigCache:
@@ -97,7 +103,7 @@ class ConfigCache:
         ```
 
     Note:
-        - 本类应作为全局单例使用（见模块底部的 `config_cache = ConfigCache()`）
+        - 每个 PikoApp 实例持有自己的缓存，避免不同应用实例共享任务配置
         - 未来可扩展为支持 TTL（过期时间）、LRU 淘汰策略等高级功能
     """
 
@@ -132,7 +138,14 @@ class ConfigCache:
                     config = cached
                 ```
         """
-        return self._cache.get(job_id)
+        config = self._cache.get(job_id)
+        if config is None:
+            return None
+        return CachedConfig(
+            config_json=config.config_json,
+            version=config.version,
+            schema_version=config.schema_version,
+        )
 
     def set(self, job_id: str, config: CachedConfig):
         """将配置写入缓存
@@ -146,7 +159,11 @@ class ConfigCache:
             - 调用方应在从数据库加载配置后立即写入缓存，保持缓存与数据库一致
             - 不检查配置的有效性（假设调用方已验证），保持方法简单高效
         """
-        self._cache[job_id] = config
+        self._cache[job_id] = CachedConfig(
+            config_json=config.config_json,
+            version=config.version,
+            schema_version=config.schema_version,
+        )
 
     def prune(self, active_job_ids: Set[str]):
         """清理不活跃的任务配置（内存管理）
@@ -167,7 +184,6 @@ class ConfigCache:
             ```
 
         Note:
-            - [修复 L4] 内存清理接口
             - 使用集合运算（差集）计算需要删除的键，时间复杂度为 O(n)，
               其中 n 为缓存中的键数量（通常远小于数据库中的任务总数）
             - 在迭代中修改字典是不安全的（可能导致 RuntimeError），
@@ -194,7 +210,3 @@ class ConfigCache:
             - 在生产环境中应谨慎使用，因为清空缓存会导致下次调度时需要重新从数据库加载所有配置
         """
         self._cache.clear()
-
-
-# 创建全局的配置缓存实例
-config_cache = ConfigCache()

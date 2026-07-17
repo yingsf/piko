@@ -1,6 +1,9 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import List, Any, Type, Dict, Callable, Awaitable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import TypeVar, cast
+
+from pydantic import BaseModel
 
 from piko.infra.logging import get_logger
 from piko.persistence.intent import WriteIntent
@@ -8,9 +11,12 @@ from piko.persistence.intent import WriteIntent
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+Handler = Callable[[list[object]], Awaitable[None]]
 
 
-def on(model_type: Type[T]):
+def on(
+    model_type: type[T],
+) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
     """模块级装饰器：标记类方法为特定类型的处理函数
 
     该装饰器用于在 TypedSink 子类中声明式地注册处理逻辑。它主要用于打标记（Tagging），并不直接修改函数行为
@@ -34,7 +40,9 @@ def on(model_type: Type[T]):
         ```
     """
 
-    def decorator(func: Callable[[List[T]], Awaitable[None]]):
+    def decorator(
+        func: Callable[..., Awaitable[None]],
+    ) -> Callable[..., Awaitable[None]]:
         # 给函数对象打上私有标记，记录它意图处理的类型
         # 这种方式不会污染函数签名，且对类继承友好
         setattr(func, "_piko_handler_for", model_type)
@@ -60,7 +68,7 @@ class ResultSink(ABC):
         - 不应在 write_batch 中阻塞过长时间（建议使用批量 API 或异步 I/O）
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         """初始化 Sink
 
         Args:
@@ -69,7 +77,7 @@ class ResultSink(ABC):
         self.name = name
 
     @abstractmethod
-    async def write_batch(self, batch: List[WriteIntent]):
+    async def write_batch(self, batch: list[WriteIntent]) -> None:
         """批量写入数据到目标存储（抽象方法）
 
         Args:
@@ -81,9 +89,8 @@ class ResultSink(ABC):
         Note:
             实现要点：
             1. 遍历 batch，提取 payload 和 idempotency_key
-            2. 查询去重表，过滤已写入的数据
+            2. 使用目标存储自身的唯一约束或幂等 API 处理重复写入
             3. 执行批量写入（使用目标存储的批量 API）
-            4. 更新去重表状态
         """
         pass
 
@@ -120,7 +127,7 @@ class TypedSink(ResultSink):
         ```
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         """初始化 TypedSink
 
         Args:
@@ -129,12 +136,13 @@ class TypedSink(ResultSink):
         super().__init__(name)
         # 路由表：类型 -> 处理函数
         # 键为 Python 类型对象（如 User、Order），值为 async 函数
-        self._handlers: Dict[Type, Callable[[List[Any]], Awaitable[None]]] = {}
+        self._handlers: dict[type[object], Handler] = {}
+        self._model_registry: dict[str, type[BaseModel]] = {}
 
-        # [新增] 初始化时执行反射扫描，自动注册带有 @on 标记的方法
+        # 实例创建后扫描带有 @on 标记的方法，建立类型路由表。
         self._auto_register_handlers()
 
-    def _auto_register_handlers(self):
+    def _auto_register_handlers(self) -> None:
         """反射扫描并注册处理函数
 
         遍历当前实例的所有属性和方法（包括继承自父类的方法），查找带有 `_piko_handler_for`
@@ -154,12 +162,17 @@ class TypedSink(ResultSink):
             try:
                 # 获取属性值（忽略访问受限的属性）
                 method = getattr(self, attr_name)
-            except Exception:
+            except Exception as error:
+                logger.debug(
+                    "typed_sink_attribute_unavailable",
+                    attribute=attr_name,
+                    error=str(error),
+                )
                 continue
 
             # 检查是否有 @on 装饰器留下的标记
             if hasattr(method, "_piko_handler_for"):
-                model_type = getattr(method, "_piko_handler_for")
+                model_type = cast(type[object], getattr(method, "_piko_handler_for"))
 
                 # 重复注册检测（优先保留最后扫描到的，通常是子类覆盖父类的情况，但仍需警告）
                 if model_type in self._handlers:
@@ -175,9 +188,19 @@ class TypedSink(ResultSink):
                     )
 
                 # 注册到路由表
-                self._handlers[model_type] = method
+                self._handlers[model_type] = cast(Handler, method)
+                if issubclass(model_type, BaseModel):
+                    self._register_model_type(model_type)
 
-    def on(self, model_type: Type[T]):
+    def _register_model_type(self, model_type: type[BaseModel]) -> None:
+        """将 Sink 声明的模型加入恢复白名单。"""
+        canonical_ref = f"{model_type.__module__}:{model_type.__qualname__}"
+        self._model_registry[canonical_ref] = model_type
+        self._model_registry[f"{model_type.__module__}.{model_type.__qualname__}"] = model_type
+
+    def on(
+        self, model_type: type[T]
+    ) -> Callable[[Callable[[list[T]], Awaitable[None]]], Callable[[list[T]], Awaitable[None]]]:
         """装饰器：注册特定类型的处理函数（实例方法版）
 
         用于在运行时动态注册处理器，或者在不支持模块级装饰器的场景下使用。
@@ -189,7 +212,9 @@ class TypedSink(ResultSink):
             Callable: 装饰器函数，返回原函数（不改变函数本身）
         """
 
-        def decorator(func: Callable[[List[T]], Awaitable[None]]):
+        def decorator(
+            func: Callable[[list[T]], Awaitable[None]],
+        ) -> Callable[[list[T]], Awaitable[None]]:
             # 重复注册检测：防止误覆盖已有处理器
             if model_type in self._handlers:
                 logger.warning(
@@ -197,14 +222,16 @@ class TypedSink(ResultSink):
                     f"Old: {self._handlers[model_type].__name__}, New: {func.__name__}"
                 )
             # 注册到路由表
-            self._handlers[model_type] = func
+            self._handlers[model_type] = cast(Handler, func)
+            if issubclass(model_type, BaseModel):
+                self._register_model_type(model_type)
 
             # 装饰器返回原函数（不修改函数本身）
             return func
 
         return decorator
 
-    async def write_batch(self, batch: List[WriteIntent]):
+    async def write_batch(self, batch: list[WriteIntent]) -> None:
         """自动分组并分发到对应的类型处理器
 
         Args:
@@ -232,10 +259,10 @@ class TypedSink(ResultSink):
               - 若都没注册，记录错误
         """
         # 第一步：按 payload 类型分组
-        grouped = defaultdict(list)
+        grouped: defaultdict[type[object], list[object]] = defaultdict(list)
 
         for intent in batch:
-            payload = intent.payload
+            payload = self._rehydrate_payload(intent)
 
             # 获取 Payload 的运行时类型
             # 注意：磁盘恢复的数据可能是 dict（model_ref 为空时）
@@ -245,7 +272,7 @@ class TypedSink(ResultSink):
         # 第二步：遍历分组，查找并调用处理器
         for p_type, items in grouped.items():
             # MRO 智能匹配：沿继承链查找最近的处理器
-            handler = None
+            handler: Handler | None = None
 
             for cls in p_type.mro():
                 if cls in self._handlers:
@@ -253,11 +280,28 @@ class TypedSink(ResultSink):
                     # 找到第一个匹配即停止（最具体的处理器）
                     break
 
-            if handler:
-                # 找到处理器，调用批量写入
-                await handler(items)
-            else:
-                logger.error(
+            if handler is None:
+                raise ValueError(
                     f"TypedSink '{self.name}' received unhandled type: {p_type}. "
                     f"Registered types: {list(self._handlers.keys())}"
                 )
+
+            # 找到处理器，调用批量写入
+            await handler(items)
+
+    def _rehydrate_payload(self, intent: WriteIntent) -> object:
+        """将磁盘恢复的字典还原为注册过的 Pydantic 模型。"""
+        payload: object = intent.payload
+        if not isinstance(payload, dict) or intent.model_ref is None:
+            if isinstance(payload, dict) and dict not in self._handlers:
+                raise ValueError(
+                    f"TypedSink '{self.name}' cannot route dict payload without a registered model_ref"
+                )
+            return cast(object, payload)
+
+        model_type = self._model_registry.get(intent.model_ref)
+        if model_type is None:
+            raise ValueError(
+                f"TypedSink '{self.name}' has no registered model for {intent.model_ref!r}"
+            )
+        return model_type.model_validate(payload)

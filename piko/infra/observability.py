@@ -2,7 +2,7 @@ from fastapi import Response
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # ============================================================================
-# --- Metrics Definition ---
+# --- 指标定义 ---
 # ============================================================================
 
 """任务执行总次数（Counter）
@@ -34,11 +34,7 @@ Example (Prometheus 查询):
     sum by (job_id) (increase(piko_job_run_total[1h]))
     ```
 """
-JOB_RUN_TOTAL = Counter(
-    "piko_job_run_total",
-    "Total number of job runs",
-    ["job_id", "status"]
-)
+JOB_RUN_TOTAL = Counter("piko_job_run_total", "Total number of job runs", ["job_id", "status"])
 
 """任务执行时间分布（Histogram）
 
@@ -75,7 +71,7 @@ JOB_DURATION_SECONDS = Histogram(
     "piko_job_duration_seconds",
     "Job execution duration in seconds",
     ["job_id"],
-    buckets=[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
+    buckets=[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0],
 )
 
 """当前实例是否为 Leader（Gauge）
@@ -109,9 +105,7 @@ Note:
     - 结合 `LEADER_CHANGES_TOTAL` Counter 可以监控 Leader 切换频率（如果频繁切换，说明网络或配置有问题）
 """
 LEADER_STATUS = Gauge(
-    "piko_leader_status",
-    "Whether this instance is the leader (1=Leader, 0=Standby)",
-    ["host"]
+    "piko_leader_status", "Whether this instance is the leader (1=Leader, 0=Standby)", ["host"]
 )
 
 
@@ -149,8 +143,25 @@ Note:
     - 如果队列长度持续为 0，说明没有任务在执行（正常）或持久化速度极快（罕见）
 """
 PERSISTENCE_QUEUE_SIZE = Gauge(
-    "piko_persistence_queue_size",
-    "Current number of items in the persistence queue"
+    "piko_persistence_queue_size", "Current number of items in the persistence queue"
+)
+
+PERSISTENCE_SINK_FAILURE_TOTAL = Counter(
+    "piko_persistence_sink_failure_total",
+    "Total number of persistence sink failures",
+    ["sink"],
+)
+PERSISTENCE_FALLBACK_TOTAL = Counter(
+    "piko_persistence_fallback_total",
+    "Total number of intents written to disk fallback",
+)
+PERSISTENCE_RECOVERY_TOTAL = Counter(
+    "piko_persistence_recovery_total",
+    "Total number of intents recovered from disk fallback",
+)
+PERSISTENCE_RECOVERY_FAILURE_TOTAL = Counter(
+    "piko_persistence_recovery_failure_total",
+    "Total number of fallback records retained for manual recovery",
 )
 
 """配置同步周期的执行次数（Counter）
@@ -182,13 +193,11 @@ Example (Prometheus 查询):
     ```
 """
 CONFIG_RECONCILE_TOTAL = Counter(
-    "piko_config_reconcile_total",
-    "Total number of config reconciliation cycles",
-    ["result"]
+    "piko_config_reconcile_total", "Total number of config reconciliation cycles", ["result"]
 )
 
 
-def metrics_endpoint():
+def metrics_endpoint() -> Response:
     """生成 Prometheus 指标的 HTTP 端点响应
 
     本函数生成符合 Prometheus 文本格式（Text Exposition Format）的指标数据，

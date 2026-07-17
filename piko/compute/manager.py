@@ -1,8 +1,9 @@
 import asyncio
 import multiprocessing
+from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Callable, Iterable, TypeVar, List, Set, Tuple
+from typing import Any, TypeVar, cast
 
 import cloudpickle
 
@@ -29,7 +30,7 @@ class _CloudPickledCallable:
         kwargs (dict): 关键字参数
     """
 
-    def __init__(self, fn: Callable[..., R], *args, **kwargs):
+    def __init__(self, fn: Callable[..., object], *args: object, **kwargs: object) -> None:
         """初始化可序列化的可调用对象包装器
 
         Args:
@@ -41,7 +42,7 @@ class _CloudPickledCallable:
         self.args = args
         self.kwargs = kwargs
 
-    def __call__(self) -> R:
+    def __call__(self) -> object:
         """执行被包装的函数
 
         在子进程中反序列化后，通过调用此方法来执行实际的计算逻辑
@@ -51,16 +52,19 @@ class _CloudPickledCallable:
         """
         return self.fn(*self.args, **self.kwargs)
 
-    def __getstate__(self):
+    def __getstate__(self) -> bytes:
         """序列化对象状态"""
         return cloudpickle.dumps((self.fn, self.args, self.kwargs))
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: bytes) -> None:
         """反序列化对象状态"""
-        self.fn, self.args, self.kwargs = cloudpickle.loads(state)
+        self.fn, self.args, self.kwargs = cast(
+            tuple[Callable[..., object], tuple[object, ...], dict[str, object]],
+            cloudpickle.loads(state),
+        )
 
 
-def _worker_entry(pickled_task: _CloudPickledCallable):
+def _worker_entry(pickled_task: _CloudPickledCallable) -> object:
     """子进程入口函数
 
     ProcessPoolExecutor 将此函数作为子进程的执行入口。接收序列化的任务对象，反序列化后执行实际的计算逻辑
@@ -85,7 +89,7 @@ class CpuManager:
         _max_workers (int): 进程池的最大工作进程数
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化 CPU 管理器
 
         根据配置或系统 CPU 核心数自动确定工作进程数
@@ -97,8 +101,15 @@ class CpuManager:
         if self._max_workers == 0:
             # 预留一个核心给主进程和操作系统，避免 CPU 100% 导致的响应延迟
             self._max_workers = max(1, multiprocessing.cpu_count() - 1)
+        self._per_job_cpu_max = int(getattr(settings, "per_job_cpu_max", self._max_workers))
+        if self._per_job_cpu_max < 1:
+            raise ValueError("per_job_cpu_max must be greater than zero")
 
-    def startup(self, initializer: Callable = None, initargs: Tuple = ()):
+    def startup(
+        self,
+        initializer: Callable[..., object] | None = None,
+        initargs: tuple[object, ...] = (),
+    ) -> None:
         """启动进程池
 
         创建固定大小的工作进程池，预热子进程以减少任务提交时的延迟。
@@ -120,12 +131,12 @@ class CpuManager:
             self._pool = ProcessPoolExecutor(
                 max_workers=self._max_workers,
                 mp_context=ctx,
-                initializer=real_initializer,
-                initargs=real_initargs
+                initializer=cast(Callable[..., Any], real_initializer),
+                initargs=cast(tuple[Any, ...], real_initargs),
             )
             logger.info("cpu_manager_started", workers=self._max_workers)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """优雅关闭进程池
 
         等待所有正在执行的任务完成后，再关闭进程池并回收资源。
@@ -135,7 +146,12 @@ class CpuManager:
             self._pool = None
             logger.info("cpu_manager_shutdown")
 
-    async def submit(self, fn: Callable[..., R], *args, **kwargs) -> R:
+    async def submit(
+        self,
+        fn: Callable[..., R],
+        *args: object,
+        **kwargs: object,
+    ) -> R:
         """异步提交单个任务到进程池
 
         将同步的 CPU 密集型函数包装为异步任务，无缝集成到 asyncio 事件循环。
@@ -156,14 +172,12 @@ class CpuManager:
 
         loop = asyncio.get_running_loop()
         task = _CloudPickledCallable(fn, *args, **kwargs)
-        return await loop.run_in_executor(self._pool, _worker_entry, task)
+        result = await loop.run_in_executor(self._pool, _worker_entry, task)
+        return cast(R, result)
 
     async def map_reduce(
-            self,
-            map_fn: Callable[[T], R],
-            items: Iterable[T],
-            concurrency: int = 0
-    ) -> List[R]:
+        self, map_fn: Callable[[T], R], items: Iterable[T], concurrency: int = 0
+    ) -> list[R]:
         """批量并行处理数据集（MapReduce 模式的 Map 阶段）
 
         对 items 中的每个元素应用 map_fn，并发执行以加速处理。
@@ -176,29 +190,44 @@ class CpuManager:
 
         Returns:
             List[R]: 所有元素的处理结果列表
+
+        Note:
+            返回值顺序与输入顺序一致。任一任务失败或调用被取消时，会取消并回收尚未完成的协程；
+            已提交到进程池的计算可能在后台完成，但其结果不会返回给调用方。
         """
         if self._pool is None:
             raise RuntimeError("CpuManager not started")
 
-        limit = concurrency if concurrency > 0 else self._max_workers
-        results = []
-        pending: Set[asyncio.Task] = set()
+        requested_limit = concurrency if concurrency > 0 else self._max_workers
+        limit = min(requested_limit, self._per_job_cpu_max)
+        if limit < 1:
+            raise ValueError("concurrency must be greater than zero")
 
-        for item in items:
-            # 1. 如果在此刻正在运行的任务达到了上限，等待至少一个完成
-            if len(pending) >= limit:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        results: dict[int, R] = {}
+        pending: dict[asyncio.Task[R], int] = {}
+        item_count = 0
+
+        try:
+            for item_count, item in enumerate(items, start=1):
+                while len(pending) >= limit:
+                    done, _ = await asyncio.wait(set(pending), return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        index = pending.pop(task)
+                        results[index] = task.result()
+
+                task = asyncio.create_task(self.submit(map_fn, item))
+                pending[task] = item_count - 1
+
+            while pending:
+                done, _ = await asyncio.wait(set(pending), return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    results.append(await task)
+                    index = pending.pop(task)
+                    results[index] = task.result()
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
 
-            # 2. 提交新任务
-            task = asyncio.create_task(self.submit(map_fn, item))
-            pending.add(task)
-
-        # 3. 等待剩余任务完成
-        if pending:
-            done, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
-            for task in done:
-                results.append(await task)
-
-        return results
+        return [results[index] for index in range(item_count)]
