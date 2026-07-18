@@ -8,7 +8,7 @@ from typing import TypeAlias, cast
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from piko.config import settings
@@ -163,12 +163,15 @@ class ConfigWatcher:
         CONFIG_RECONCILE_TOTAL.labels(result="success").inc()
 
     async def _database_now(self, session: AsyncSession) -> datetime:
-        """读取数据库时间作为增量同步边界。"""
-        result = await session.execute(text("SELECT UTC_TIMESTAMP(6)"))
-        value = result.scalar_one()
-        if not isinstance(value, datetime):
-            raise RuntimeError("database did not return a datetime for UTC_TIMESTAMP")
-        return value
+        """读取增量同步边界时间
+
+        与 ``ScheduledJob.updated_at``（由 ``piko.infra.db.utcnow`` 即 Python 端
+        UTC 时间写入）使用同一时钟源，避免跨主机时钟偏差导致增量过滤
+        （``updated_at >= last_sync_at``）漏掉刚写入的变更。
+        """
+        from piko.infra.db import utcnow
+
+        return utcnow()
 
     def _sync_system_config(self) -> None:
         """应用系统级动态配置中唯一受支持的轮询间隔。"""

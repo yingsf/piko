@@ -7,6 +7,7 @@ from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import pool
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from piko.config import settings
@@ -47,7 +48,7 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
     )
 
-    def do_run_migrations(sync_connection: object) -> None:
+    def do_run_migrations(sync_connection: Connection) -> None:
         """在同步回调中配置 Alembic 事务"""
         context.configure(
             connection=sync_connection,

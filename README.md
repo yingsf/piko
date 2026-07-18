@@ -1,9 +1,9 @@
 # Piko - Data-Oriented Async Task Orchestrator
 
-[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.9-blue.svg)](https://pypi.org/project/piko-cucc/0.1.9/)
-[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](https://github.com/yingsf/piko/releases)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI version](https://img.shields.io/pypi/v/piko-cucc.svg?label=PyPI)](https://pypi.org/project/piko-cucc/)
+[![Python versions](https://img.shields.io/pypi/pyversions/piko-cucc.svg?label=Python)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/pypi/l/piko-cucc.svg)](https://opensource.org/licenses/MIT)
+[![GitHub release](https://img.shields.io/github/v/release/yingsf/piko?label=GitHub)](https://github.com/yingsf/piko/releases)
 
 > 一个面向 **数据任务（ETL / 同步 / 扫描 / 归档 / 监控）** 的异步并发编排框架： 
 > 
@@ -206,7 +206,16 @@ export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@127.0.0.1:3306/piko?charset=ut
 
 > 也可以写到 `settings.toml / piko.toml`，或用 `PIKO_SETTINGS_PATH` 指向自定义配置文件。
 
-### 3) 写一个 Job，然后跑起来
+### 3) 初始化数据库 schema
+
+```bash
+piko db upgrade    # 创建全部表并写入 schema 版本
+piko db current    # 确认输出 schema_v1
+```
+
+PikoApp 启动时会校验 schema 版本，未初始化或版本不匹配会直接启动失败。详见 [数据库迁移](#数据库迁移)。
+
+### 4) 写一个 Job，然后跑起来
 
 ```python
 # app.py
@@ -838,24 +847,57 @@ leader_renew_interval_s = 10
 
 ## 数据库迁移
 
-Piko 启动时只校验 schema 版本，不会自动执行 DDL。首次部署或升级时，在发布步骤中单独运行迁移：
+Piko 启动时**只校验 schema 版本，不会自动执行 DDL**——每个应用副本启动时跑 DDL 在多副本部署下是危险的。首次部署或升级时，请在发布流程中单独执行迁移（典型做法是用一个 init-job / 发布前脚本）。
+
+### 安装即可用的 CLI
+
+从 v0.1.10 起，迁移脚本与 Alembic 配置随 `piko` 包一起发布，安装后直接通过 `piko db` 命令管理数据库 schema，无需从源码仓库复制任何文件：
 
 ```bash
+pip install piko-cucc
+
+# 数据库连接通过 PIKO_MYSQL_DSN 配置（与应用启动使用同一配置源）
 export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@host:3306/piko?charset=utf8mb4"
-uv run python scripts/migrate.py upgrade
+
+piko db upgrade            # 升级到 head（首次部署会创建全部表）
+piko db current            # 查看当前 schema 版本
+piko db downgrade -1       # 回退一步（降级前务必备份数据库）
+piko db history            # 查看完整迁移版本链
 ```
 
-迁移入口使用 MySQL advisory lock，同一数据库同时只有一个副本执行 Alembic。发布前可生成离线 SQL：
+每个子命令都支持 `--lock-timeout-s`（默认读 `PIKO_MIGRATION_LOCK_TIMEOUT_S=30`）。
+
+### 多副本安全：MySQL advisory lock
+
+`piko db upgrade/downgrade` 在执行 Alembic 期间持有 MySQL 数据库级 advisory lock（锁名 `piko-schema-migration`），保证同一数据库**同时只有一个副本执行 DDL**。在 Kubernetes 等多副本环境，多个 init-job 同时启动迁移时，只有一个会真正执行，其余会等待锁（最多 `--lock-timeout-s` 秒，超时则失败退出）。
+
+### Schema 版本与升级路径
+
+当前 schema head 为 `schema_v1`——表示当前表结构定型的第一版基线。PikoApp 启动时会校验数据库的 `alembic_version` 必须等于 `schema_v1`，不匹配则启动失败（避免代码与 schema 不一致导致运行时错误）。
+
+- **首次部署**：空库执行 `piko db upgrade` 即可，会按迁移链建出全部表并把版本写到 `schema_v1`。
+- **从 v0.1.9 及更早版本升级**：旧库的版本号是 `0005_remove_sink_dedupe`，执行一次 `piko db upgrade` 会自动迁移到 `schema_v1`（仅更新版本号，无表结构变更），无损升级。**务必先迁移再启动新版本应用。**
+- **查看当前版本**：`piko db current` 或直接 `SELECT version_num FROM alembic_version`。
+
+### 离线 SQL（DBA 审核场景）
+
+发布前可生成不连接数据库的迁移 SQL，交给 DBA 审核后手动执行：
 
 ```bash
-uv run alembic upgrade head --sql > /tmp/piko-upgrade.sql
+# 在仓库内（需要迁移文件）生成离线 SQL
+uv run alembic -c piko/migrations/alembic.ini upgrade head --sql > /tmp/piko-upgrade.sql
 ```
 
-降级只用于已验证的回滚窗口，并应先备份数据库：
+### 业务项目自定义表的推荐做法
 
-```bash
-uv run python scripts/migrate.py downgrade -1
-```
+Piko 只管理自己的 5 张表（`scheduled_job`/`job_config`/`job_run`/`job_lock`/`scheduler_leader`）。如果你的业务项目还需要额外的表，**不要修改 Piko 的迁移文件**（会导致升级时冲突），推荐两种方式：
+
+1. **独立 Alembic env（推荐）**：业务项目使用自己的 Alembic 配置和迁移目录，与 Piko 的迁移链完全解耦。两套迁移可以共用同一个数据库，各自的 `alembic_version` 表互不干扰（业务项目用独立的 `version_table`）。
+2. **合并 metadata**：如果希望统一管理，业务项目的 `target_metadata` 可以同时包含 `piko.infra.db.Base.metadata` 和业务自身的 metadata，但 autogenerate 时应排除 Piko 的表（在 `env.py` 的 `include_object` 钩子里过滤），避免业务迁移反向修改 Piko 表。
+
+### `create_all_tables()` 仅用于测试
+
+`piko.infra.db.create_all_tables()` 通过 `Base.metadata.create_all` 直接建表，**不写 `alembic_version` 记录**，仅用于隔离测试或本地临时库的快速初始化。**生产环境必须通过 `piko db upgrade` 管理 schema**，不要使用此函数。
 
 ---
 

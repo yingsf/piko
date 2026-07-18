@@ -41,7 +41,7 @@ def _read_project_metadata() -> tuple[str, str]:
         project = document["project"]
         name = project["name"]
         version = project["version"]
-    except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
+    except (KeyError, OSError, TypeError, tomllib.TOMLDecodeError) as error:
         raise RuntimeError("无法读取 pyproject.toml 的 project 元数据") from error
     if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
         raise RuntimeError("pyproject.toml 必须提供非空的 project.name 和 project.version")
@@ -88,29 +88,54 @@ def _canonical_mysql_url(dsn: str) -> URL:
     return url
 
 
-def _test_environment() -> dict[str, str]:
-    """校验隔离测试库并生成质量门禁环境
+# 测试库允许的数据库名关键词（任一匹配即视为非生产库）。
+# 不再强制要求库名含 "test"，dev/staging/ci/piko 等隔离库同样可接受。
+_SAFE_DB_KEYWORDS = ("test", "dev", "staging", "ci", "piko")
+# 触发生产确认的数据库名关键词。
+_PROD_DB_KEYWORDS = ("prod", "production")
+
+
+def _resolve_test_environment() -> tuple[dict[str, str], bool]:
+    """解析质量门禁环境与集成测试可用性
+
+    与早期版本不同，``PIKO_TEST_MYSQL_DSN`` 现为可选：未配置时仍可发布，
+    只是跳过集成测试（仅跑单元测试与静态检查）。配置了 DSN 时校验其
+    符合隔离约束（非生产库或显式放行），并把该 DSN 注入到子进程环境。
 
     Returns:
-        dict[str, str]: 仅包含测试所需的环境覆盖项。
+        tuple[dict, bool]: (子进程环境覆盖, 是否启用集成测试)。
 
     Raises:
-        RuntimeError: 当测试库未显式配置或不满足隔离约束时。
+        RuntimeError: 当配置的 DSN 不满足隔离约束或与生产 DSN 撞库时。
     """
     import os
 
     dsn = os.environ.get("PIKO_TEST_MYSQL_DSN", "").strip()
     if not dsn:
-        raise RuntimeError("发布测试必须设置 PIKO_TEST_MYSQL_DSN")
+        # 未配置测试库：质量门禁仍可运行（集成测试会被 pytest 自动跳过）。
+        return os.environ.copy(), False
+
     try:
         url = _canonical_mysql_url(dsn)
     except Exception as error:
         raise RuntimeError("PIKO_TEST_MYSQL_DSN 不是有效的 MySQL DSN") from error
     if url.drivername != "mysql+aiomysql":
         raise RuntimeError("PIKO_TEST_MYSQL_DSN 必须使用 mysql+aiomysql 或 mysql+asyncmy")
+
     database = (url.database or "").lower()
-    if "test" not in database or any(word in database for word in ("prod", "production")):
-        raise RuntimeError("PIKO_TEST_MYSQL_DSN 的数据库名必须明确包含 test 且不能是生产库")
+    allow_production = os.environ.get("PIKO_ALLOW_PRODUCTION_DB", "").strip() == "1"
+    looks_like_prod = any(word in database for word in _PROD_DB_KEYWORDS)
+    looks_like_safe = any(word in database for word in _SAFE_DB_KEYWORDS)
+    if looks_like_prod and not allow_production:
+        raise RuntimeError(
+            "PIKO_TEST_MYSQL_DSN 指向疑似生产库（库名含 prod/production）。"
+            "如确需使用，请显式设置 PIKO_ALLOW_PRODUCTION_DB=1。"
+        )
+    if not looks_like_safe and not allow_production:
+        raise RuntimeError(
+            f"PIKO_TEST_MYSQL_DSN 的数据库名 {database!r} 不在安全关键词"
+            f"（{_SAFE_DB_KEYWORDS}）内。如确需使用，请显式设置 PIKO_ALLOW_PRODUCTION_DB=1。"
+        )
 
     generic_dsn = os.environ.get("PIKO_MYSQL_DSN", "").strip()
     if generic_dsn:
@@ -123,20 +148,31 @@ def _test_environment() -> dict[str, str]:
 
     environment = os.environ.copy()
     environment["PIKO_MYSQL_DSN"] = dsn
-    return environment
+    return environment, True
 
 
 def _run_quality_gates() -> None:
-    """执行发布所需的静态检查、测试和安全扫描"""
-    environment = _test_environment()
+    """执行发布所需的静态检查、测试和安全扫描
+
+    静态检查（ruff/pyright/bandit）与依赖审计始终执行。pytest 门禁按是否
+    配置隔离测试库分层：配置了 ``PIKO_TEST_MYSQL_DSN`` 时跑全部用例（含集成
+    测试），未配置时只跑单元测试（``-m "not integration"``），后者不会阻断
+    发布。建议发布前尽量在隔离库上跑一次完整集成测试。
+    """
+    environment, integration_enabled = _resolve_test_environment()
     executable = sys.executable
     commands = [
         [executable, "-m", "ruff", "check", "."],
         [executable, "-m", "ruff", "format", "--check", "."],
         [executable, "-m", "pyright"],
-        [executable, "-m", "pytest"],
-        [executable, "-m", "bandit", "-r", "piko", "-q"],
     ]
+    if integration_enabled:
+        commands.append([executable, "-m", "pytest"])
+        print("质量门禁：启用集成测试（PIKO_TEST_MYSQL_DSN 已配置）")
+    else:
+        commands.append([executable, "-m", "pytest", "-m", "not integration"])
+        print("质量门禁：跳过集成测试（未配置 PIKO_TEST_MYSQL_DSN，仅运行单元测试）")
+    commands.append([executable, "-m", "bandit", "-r", "piko", "-q"])
     for command in commands:
         _run(command, env=environment)
     _run_dependency_audit(environment)

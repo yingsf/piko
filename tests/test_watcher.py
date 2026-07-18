@@ -2,7 +2,7 @@ import json
 import os
 
 import pytest
-from sqlalchemy import delete, insert, update
+from sqlalchemy import delete, insert
 
 import piko.infra.db as db_infra
 from piko import PikoApp
@@ -77,11 +77,13 @@ async def test_watcher_reconcile(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cached.config_json == {"foo": "bar"}
 
     async with db_infra.get_session_context() as session:
-        await session.execute(
-            update(ScheduledJob)
-            .where(ScheduledJob.job_id == "watcher_test_job")
-            .values(enabled=False)
-        )
+        # 通过 ORM 实体更新（而非 Core update），使 SQLAlchemy 的 onupdate
+        # 自动刷新 updated_at。watcher 的增量同步以 updated_at >= last_sync
+        # 为边界，Core update 不会触发 onupdate，会导致变更被增量过滤漏掉。
+        # 真实运维中配置变更通常经 ORM 或显式带 updated_at，此处与之对齐。
+        job = await session.get(ScheduledJob, "watcher_test_job")
+        assert job is not None
+        job.enabled = False
         await session.commit()
 
     await app.watcher.reconcile_once()

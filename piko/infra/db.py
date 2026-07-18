@@ -27,7 +27,7 @@ from piko.config import settings
 from piko.infra.logging import get_logger
 
 logger = get_logger(__name__)
-CURRENT_SCHEMA_REVISION = "0005_remove_sink_dedupe"
+CURRENT_SCHEMA_REVISION = "schema_v1"
 
 
 def normalize_mysql_dsn(dsn: str) -> URL:
@@ -175,7 +175,7 @@ async def verify_schema() -> None:
             result = await connection.execute(text("SELECT version_num FROM alembic_version"))
         except Exception as error:
             raise RuntimeError(
-                "Database schema is not initialized; run 'python scripts/migrate.py' first."
+                "Database schema is not initialized; run 'piko db upgrade' first."
             ) from error
         revision = result.scalar_one_or_none()
     if revision != CURRENT_SCHEMA_REVISION:
