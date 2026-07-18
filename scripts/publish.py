@@ -277,16 +277,22 @@ def _build_and_check(name: str, version: str) -> list[Path]:
 
 
 def _upload(target: str, artifacts: list[Path]) -> None:
-    """按目标和显式确认变量上传构建产物"""
+    """按目标和显式确认变量上传构建产物
+
+    使用 ``--repository`` 而非 ``--repository-url``，让 twine 从 ``~/.pypirc``
+    的对应段（``[pypi]`` / ``[testpypi]``）读取上传地址与凭据（API token）。
+    ``--repository-url`` 模式不会读取 pypirc 的凭据，在没有 TWINE_USERNAME/
+    TWINE_PASSWORD 环境变量时会因 ``Credential not found`` 失败。
+    """
     import os
 
     if target == "pypi":
         confirmation = os.environ.get(PYPI_CONFIRMATION)
-        repository_url = "https://upload.pypi.org/legacy/"
+        repository = "pypi"
         variable = PYPI_CONFIRMATION
     else:
         confirmation = os.environ.get(TEST_CONFIRMATION)
-        repository_url = "https://test.pypi.org/legacy/"
+        repository = "testpypi"
         variable = TEST_CONFIRMATION
     if confirmation != "publish":
         raise RuntimeError(f"上传前必须设置 {variable}=publish")
@@ -297,8 +303,8 @@ def _upload(target: str, artifacts: list[Path]) -> None:
             "twine",
             "upload",
             "--non-interactive",
-            "--repository-url",
-            repository_url,
+            "--repository",
+            repository,
             *(str(path) for path in artifacts),
         ]
     )
