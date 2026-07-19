@@ -16,6 +16,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
+      - run: uv run pyright -p pyrightconfig.tests.json
       - run: uv run pytest
       - run: uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file /tmp/piko-requirements.txt
       - run: uv run pip-audit --strict --disable-pip -r /tmp/piko-requirements.txt

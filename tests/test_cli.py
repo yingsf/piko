@@ -82,9 +82,9 @@ def test_schema_v1_revision_file_exists_in_package() -> None:
     assert (versions_dir / "schema_v1.py").is_file()
 
 
-def test_current_schema_revision_constant_is_schema_v1() -> None:
-    """验证启动校验期望值已更新为 schema_v1"""
-    assert CURRENT_SCHEMA_REVISION == "schema_v1"
+def test_current_schema_revision_constant_is_workflow_head() -> None:
+    """Workflow tables are part of the current schema contract."""
+    assert CURRENT_SCHEMA_REVISION == "0006_workflow_control_plane"
 
 
 def test_resolve_timeout_reads_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,8 +110,8 @@ def test_resolve_timeout_falls_back_to_30(monkeypatch: pytest.MonkeyPatch) -> No
     not os.getenv("PIKO_TEST_MYSQL_DSN"),
     reason="需要通过 PIKO_TEST_MYSQL_DSN 指定隔离测试数据库",
 )
-def test_db_upgrade_initializes_to_schema_v1() -> None:
-    """验证空库执行 ``piko db upgrade`` 后版本为 schema_v1
+def test_db_upgrade_initializes_to_workflow_head() -> None:
+    """验证空库执行 ``piko db upgrade`` 后版本为 workflow head
 
     采用同步测试函数：CLI 入口内部用 asyncio.run，在同步上下文调用才不会
     与已有事件循环冲突（真实命令行场景即如此）。conftest 已通过
@@ -127,6 +127,11 @@ def test_db_upgrade_initializes_to_schema_v1() -> None:
         db_infra.init_db()
         async with db_infra.get_session_context() as session:
             for table in (
+                "workflow_task_manifest",
+                "workflow_task_event",
+                "workflow_task_dependency",
+                "workflow_task",
+                "workflow_run",
                 "job_lock",
                 "job_run",
                 "job_config",
@@ -155,4 +160,4 @@ def test_db_upgrade_initializes_to_schema_v1() -> None:
 
     # 3) 校验版本（独立事件循环）
     version = asyncio.run(_read_version())
-    assert version == "schema_v1"
+    assert version == "0006_workflow_control_plane"

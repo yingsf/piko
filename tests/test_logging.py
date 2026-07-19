@@ -4,7 +4,7 @@ from typing import Any
 
 import structlog
 
-from piko.infra.logging import LazyLoggerProxy
+from piko.infra.logging import LazyLoggerProxy, set_log_identity
 
 
 class _FakeBoundLogger:
@@ -43,3 +43,13 @@ def test_lazy_logger_caches_bound_logger(monkeypatch: Any) -> None:
     assert get_logger_calls == 1
     assert fake_logger.bind_calls == 1
     assert [event[1] for event in fake_logger.events] == ["first", "second"]
+
+
+def test_log_identity_is_bound_to_structlog_context() -> None:
+    """验证消费方应用名可作为所有日志的共享上下文。"""
+    structlog.contextvars.clear_contextvars()
+    try:
+        set_log_identity("example_service")
+        assert structlog.contextvars.get_contextvars() == {"app": "example_service"}
+    finally:
+        structlog.contextvars.clear_contextvars()

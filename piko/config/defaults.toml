@@ -111,6 +111,10 @@ job_handler_timeout_s = 300
 # shutdown_timeout_s: 应用整体优雅停机预算（秒）
 shutdown_timeout_s = 30
 
+# shutdown_worker_budget_fraction: Worker 占用应用停机预算的最大比例
+# 剩余时间留给 watcher、scheduler、leader、writer、CPU manager 和数据库清理
+shutdown_worker_budget_fraction = 0.5
+
 # ============================================================================
 # Persistence - 持久化与缓冲配置
 # ============================================================================

@@ -123,12 +123,23 @@ def _get_shared_processors() -> list[Any]:
     ]
 
 
-def setup_logging() -> None:
+def set_log_identity(app_name: str) -> None:
+    """设置当前进程日志使用的应用身份。"""
+    normalized_name = app_name.strip()
+    if not normalized_name:
+        raise ValueError("app_name must not be empty")
+    structlog.contextvars.bind_contextvars(app=normalized_name)
+
+
+def setup_logging(app_name: str | None = None) -> None:
     """全局初始化日志系统
 
     本函数配置 structlog 和标准库 logging，确保：
         1. 所有日志使用统一的格式（JSON 或 Console）
         2. 标准库的日志（如 uvicorn、apscheduler）也通过 structlog 输出
+
+    Args:
+        app_name: 消费方应用名。设置后，Piko 和标准库日志都会带上 `app` 字段。
     """
     global _logging_config_generation
 
@@ -154,6 +165,8 @@ def setup_logging() -> None:
 
     _configure_stdlib_logging(processors)
     _logging_config_generation += 1
+    if app_name is not None:
+        set_log_identity(app_name)
 
 
 def _configure_stdlib_logging(processors: list[Any]) -> None:

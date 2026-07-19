@@ -210,7 +210,7 @@ export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@127.0.0.1:3306/piko?charset=ut
 
 ```bash
 piko db upgrade    # 创建全部表并写入 schema 版本
-piko db current    # 确认输出 schema_v1
+piko db current    # 确认输出 0006_workflow_control_plane
 ```
 
 PikoApp 启动时会校验 schema 版本，未初始化或版本不匹配会直接启动失败。详见 [数据库迁移](#数据库迁移)。
@@ -873,10 +873,10 @@ piko db history            # 查看完整迁移版本链
 
 ### Schema 版本与升级路径
 
-当前 schema head 为 `schema_v1`——表示当前表结构定型的第一版基线。PikoApp 启动时会校验数据库的 `alembic_version` 必须等于 `schema_v1`，不匹配则启动失败（避免代码与 schema 不一致导致运行时错误）。
+当前 schema head 为 `0006_workflow_control_plane`。PikoApp 启动时会校验数据库的 `alembic_version` 必须等于该 head，不匹配则启动失败（避免代码与 schema 不一致导致运行时错误）。
 
-- **首次部署**：空库执行 `piko db upgrade` 即可，会按迁移链建出全部表并把版本写到 `schema_v1`。
-- **从 v0.1.9 及更早版本升级**：旧库的版本号是 `0005_remove_sink_dedupe`，执行一次 `piko db upgrade` 会自动迁移到 `schema_v1`（仅更新版本号，无表结构变更），无损升级。**务必先迁移再启动新版本应用。**
+- **首次部署**：空库执行 `piko db upgrade` 即可，会按迁移链建出全部表并把版本写到 `0006_workflow_control_plane`。
+- **从 v0.1.9 及更早版本升级**：旧库会依次经过 `schema_v1` 和 `0006_workflow_control_plane`，新增 workflow control-plane 表，不修改旧的 `scheduled_job`/`job_run` 语义。**务必先迁移再启动新版本应用。**
 - **查看当前版本**：`piko db current` 或直接 `SELECT version_num FROM alembic_version`。
 
 ### 离线 SQL（DBA 审核场景）
@@ -890,7 +890,7 @@ uv run alembic -c piko/migrations/alembic.ini upgrade head --sql > /tmp/piko-upg
 
 ### 业务项目自定义表的推荐做法
 
-Piko 只管理自己的 5 张表（`scheduled_job`/`job_config`/`job_run`/`job_lock`/`scheduler_leader`）。如果你的业务项目还需要额外的表，**不要修改 Piko 的迁移文件**（会导致升级时冲突），推荐两种方式：
+Piko 管理调度表（`scheduled_job`/`job_config`/`job_run`/`job_lock`/`scheduler_leader`）和通用 workflow 表（`workflow_run`/`workflow_task`/`workflow_task_dependency`/`workflow_task_event`/`workflow_task_manifest`）。如果你的业务项目还需要额外的表，**不要修改 Piko 的迁移文件**（会导致升级时冲突），推荐两种方式：
 
 1. **独立 Alembic env（推荐）**：业务项目使用自己的 Alembic 配置和迁移目录，与 Piko 的迁移链完全解耦。两套迁移可以共用同一个数据库，各自的 `alembic_version` 表互不干扰（业务项目用独立的 `version_table`）。
 2. **合并 metadata**：如果希望统一管理，业务项目的 `target_metadata` 可以同时包含 `piko.infra.db.Base.metadata` 和业务自身的 metadata，但 autogenerate 时应排除 Piko 的表（在 `env.py` 的 `include_object` 钩子里过滤），避免业务迁移反向修改 Piko 表。
@@ -962,7 +962,7 @@ Piko 内置 FastAPI 运维端点（无需你自己写）：
 - `GET /readyz`：就绪探针（readiness；Follower 会是 standby）
 - `GET /metrics`：Prometheus 指标
 
-这些端点只应绑定在私网/监控网段，或放在已有认证反向代理和 NetworkPolicy 后面；Piko 不提供默认的 HTTP 认证。生产默认关闭 `/docs`、`/redoc` 和 `/openapi.json`，仅在 `api_docs_enabled = true` 且访问边界受控时临时开启。`/readyz` 会在数据库、Writer、Watcher、Scheduler 或 Leader 未就绪时返回 HTTP 503。
+这些端点只应绑定在私网/监控网段，或放在已有认证反向代理和 NetworkPolicy 后面；Piko 不提供默认的 HTTP 认证。生产默认关闭 `/docs`、`/redoc` 和 `/openapi.json`，仅在 `api_docs_enabled = true` 且访问边界受控时临时开启。`/readyz` 会在数据库、Writer、Watcher、Scheduler、Workflow Worker 或 Leader 未就绪时返回 HTTP 503。
 
 常见指标（示意）：
 

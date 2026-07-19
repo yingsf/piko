@@ -1,6 +1,6 @@
 [project]
 name = "piko-cucc"
-version = "0.1.10"
+version = "0.1.11"
 description = "Data-Oriented Async Task Orchestrator"
 readme = "README.md"
 requires-python = ">=3.12"

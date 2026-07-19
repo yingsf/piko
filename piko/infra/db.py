@@ -8,6 +8,7 @@ from sqlalchemy import (
     String,
     Integer,
     Boolean,
+    ForeignKey,
     Index,
     UniqueConstraint,
     text,
@@ -27,7 +28,10 @@ from piko.config import settings
 from piko.infra.logging import get_logger
 
 logger = get_logger(__name__)
-CURRENT_SCHEMA_REVISION = "schema_v1"
+CURRENT_SCHEMA_REVISION = "0006_workflow_control_plane"
+DATABASE_NOT_INITIALIZED_MESSAGE = "Database not initialized. Call init_db() first."
+WORKFLOW_RUN_FOREIGN_KEY = "workflow_run.run_id"
+WORKFLOW_TASK_FOREIGN_KEY = "workflow_task.task_id"
 
 
 def normalize_mysql_dsn(dsn: str) -> URL:
@@ -142,10 +146,17 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def get_session_context() -> AsyncGenerator[AsyncSession, None]:
     """以异步上下文管理器提供一个数据库会话。"""
     if _session_maker is None:
-        raise RuntimeError("Database not initialized. Call init_db() first.")
+        raise RuntimeError(DATABASE_NOT_INITIALIZED_MESSAGE)
 
     async with _session_maker() as session:
         yield session
+
+
+def get_session_maker() -> async_sessionmaker[AsyncSession]:
+    """Return the initialized session factory for injected repositories."""
+    if _session_maker is None:
+        raise RuntimeError(DATABASE_NOT_INITIALIZED_MESSAGE)
+    return _session_maker
 
 
 async def create_all_tables() -> None:
@@ -168,7 +179,7 @@ async def verify_schema() -> None:
         RuntimeError: 当迁移版本缺失、过旧或数据库尚未初始化时。
     """
     if _engine is None:
-        raise RuntimeError("Database not initialized. Call init_db() first.")
+        raise RuntimeError(DATABASE_NOT_INITIALIZED_MESSAGE)
 
     async with _engine.connect() as connection:
         try:
@@ -337,4 +348,153 @@ class SchedulerLeader(Base):
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class WorkflowRun(Base):
+    """Durable workflow instance; independent from the legacy job_run table."""
+
+    __tablename__ = "workflow_run"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    config_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    config_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    business_result_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "idempotency_key", name="uq_workflow_run_idempotency"),
+        Index("idx_workflow_run_status", "status"),
+        Index("idx_workflow_run_updated", "updated_at"),
+    )
+
+
+class WorkflowTask(Base):
+    """One technical task in one workflow run."""
+
+    __tablename__ = "workflow_task"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_RUN_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    workflow_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    stage: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    available_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_until: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "stage", name="uq_workflow_task_run_stage"),
+        UniqueConstraint("idempotency_key", name="uq_workflow_task_idempotency"),
+        Index("idx_workflow_task_claim", "status", "available_at", "stage"),
+        Index("idx_workflow_task_lease", "status", "lease_until"),
+        Index("idx_workflow_task_run", "run_id", "status"),
+    )
+
+
+class WorkflowTaskDependency(Base):
+    """Same-run DAG edge with explicit technical/business activation rules."""
+
+    __tablename__ = "workflow_task_dependency"
+
+    dependency_id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_RUN_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_TASK_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    depends_on_task_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_TASK_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    condition_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "task_id", "depends_on_task_id", name="uq_workflow_task_dependency"
+        ),
+        Index("idx_workflow_dependency_task", "run_id", "task_id"),
+        Index("idx_workflow_dependency_upstream", "run_id", "depends_on_task_id"),
+    )
+
+
+class WorkflowTaskEvent(Base):
+    """Append-only lifecycle audit event."""
+
+    __tablename__ = "workflow_task_event"
+
+    event_id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_TASK_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_RUN_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_workflow_event_task_time", "task_id", "created_at"),
+        Index("idx_workflow_event_run_stage", "run_id", "stage", "created_at"),
+    )
+
+
+class WorkflowTaskManifest(Base):
+    """Business result manifest committed with technical finalization."""
+
+    __tablename__ = "workflow_task_manifest"
+
+    manifest_id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_TASK_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey(WORKFLOW_RUN_FOREIGN_KEY, ondelete="CASCADE"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    result_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    output_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("task_id", name="uq_workflow_manifest_task"),
+        UniqueConstraint("idempotency_key", name="uq_workflow_manifest_idempotency"),
+        Index("idx_workflow_manifest_run", "run_id"),
     )

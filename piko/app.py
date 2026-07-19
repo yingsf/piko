@@ -1,9 +1,12 @@
 import asyncio
 import importlib
+import os
 import pkgutil
 import signal
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+import uuid
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from types import ModuleType
 from typing import Type, Dict, List, Set
 
@@ -23,18 +26,25 @@ from piko.core.types import BackfillPolicy
 from piko.core.watcher import ConfigWatcher
 from piko.infra.db import (
     check_database_connection,
+    get_session_maker,
     get_session_context,
     init_db,
     reset_db,
     ScheduledJob,
     verify_schema,
+    utcnow,
 )
 from piko.infra.leader import get_leader_mutex, get_leader_watchdog
 from piko.infra.logging import get_logger, setup_logging
 from piko.infra.observability import metrics_endpoint
 from piko.persistence.writer import PersistenceWriter
+from piko.workflow.mysql_repository import MySQLWorkflowRepository
+from piko.workflow.repository import WorkflowControlBackend
+from piko.workflow.types import WorkflowDefinition, WorkflowRunRecord
+from piko.workflow.worker import WorkflowHandler, WorkflowWorker, WorkflowWorkerConfig
 
 logger = get_logger(__name__)
+_APP_NOT_STARTED = "PikoApp is not started"
 
 
 class PikoApp:
@@ -71,6 +81,10 @@ class PikoApp:
         self.registry = JobRegistry()
         self.config_cache = ConfigCache()
         self.writer = PersistenceWriter()
+        self.workflow_repository: WorkflowControlBackend | None = None
+        self.workflow_handlers: dict[str, WorkflowHandler] = {}
+        self.workflow_worker: WorkflowWorker | None = None
+        self._workflow_worker_task: asyncio.Task[None] | None = None
 
         # CPU 计算池由应用实例持有
         self.cpu_manager = CpuManager()
@@ -173,7 +187,7 @@ class PikoApp:
     def _register_api_routes(self):
         """注册内置的运维 API 路由"""
 
-        async def healthz():
+        def healthz():
             """健康检查端点 (Liveness Probe)"""
             status = "shutting_down" if self.is_shutdown_initiated else "ok"
             return JSONResponse(content={"status": status, "shutdown": self.is_shutdown_initiated})
@@ -192,6 +206,11 @@ class PikoApp:
                 "writer": self.writer.is_running,
                 "watcher": self.watcher.is_running,
                 "scheduler": self.scheduler.is_running,
+                "workflow_worker": (
+                    self.workflow_worker is not None
+                    and self._workflow_worker_task is not None
+                    and not self._workflow_worker_task.done()
+                ),
                 "leader": not settings.leader_enabled or leader.is_leader,
             }
             ready = all(checks.values()) and not self.is_shutdown_initiated
@@ -205,7 +224,7 @@ class PikoApp:
 
         self.api_app.add_api_route("/readyz", readyz, methods=["GET"])
 
-        async def metrics():
+        def metrics():
             """Prometheus 指标端点"""
             if not settings.metrics_enabled:
                 return JSONResponse(status_code=404, content={"detail": "metrics disabled"})
@@ -246,6 +265,121 @@ class PikoApp:
             resources=resources,
         )
 
+    def workflow(self, stage: str) -> Callable[[WorkflowHandler], WorkflowHandler]:
+        """Register a durable workflow handler for one stage."""
+
+        def register(handler: WorkflowHandler) -> WorkflowHandler:
+            self.register_workflow_handler(stage, handler)
+            return handler
+
+        return register
+
+    def register_workflow_handler(self, stage: str, handler: WorkflowHandler) -> None:
+        """Register or replace a workflow handler before or after startup."""
+        if not stage.strip():
+            raise ValueError("workflow stage must not be blank")
+        self.workflow_handlers[stage] = handler
+        if self.workflow_worker is not None:
+            self.workflow_worker.register_handler(stage, handler)
+
+    async def start_workflow_worker(
+        self, config: WorkflowWorkerConfig | None = None
+    ) -> WorkflowWorker:
+        """Recover and start the workflow worker owned by this application."""
+        if self.workflow_repository is None:
+            raise RuntimeError(_APP_NOT_STARTED)
+        if self._workflow_worker_task is not None and not self._workflow_worker_task.done():
+            if self.workflow_worker is None:
+                raise RuntimeError("workflow worker task exists without a worker")
+            return self.workflow_worker
+        now = utcnow()
+        await self.workflow_repository.recover_expired_running_tasks(now=now)
+        await self.workflow_repository.recover_retry_waiting_tasks(now=now)
+        await self.workflow_repository.activate_ready_tasks(now=now)
+        worker_config = config or WorkflowWorkerConfig(
+            worker_id=f"{self.name}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        )
+        shutdown_budget = max(0.0, float(getattr(settings, "shutdown_timeout_s", 30)))
+        usable_budget = self._worker_shutdown_budget(shutdown_budget)
+        usable_budget = max(0.0, usable_budget - min(0.1, usable_budget / 10))
+        cleanup_budget = min(worker_config.cancel_cleanup_seconds, usable_budget / 4)
+        grace_budget = max(0.0, usable_budget - cleanup_budget)
+        worker_config = replace(
+            worker_config,
+            cancel_cleanup_seconds=cleanup_budget,
+            shutdown_grace_seconds=min(worker_config.shutdown_grace_seconds, grace_budget),
+        )
+        worker = WorkflowWorker(
+            backend=self.workflow_repository,
+            handlers=self.workflow_handlers,
+            config=worker_config,
+            now=utcnow,
+        )
+        self.workflow_worker = worker
+        self._workflow_worker_task = asyncio.create_task(
+            worker.run(), name=f"{self.name}-workflow-worker"
+        )
+        return worker
+
+    async def stop_workflow_worker(self, shutdown_budget_seconds: float | None = None) -> None:
+        """Stop the workflow worker and let its grace-period cleanup finish."""
+        worker = self.workflow_worker
+        worker_task = self._workflow_worker_task
+        if worker is None or worker_task is None:
+            return
+        worker.request_stop()
+        shutdown_budget = shutdown_budget_seconds
+        if shutdown_budget is None:
+            shutdown_budget = (
+                worker.config.shutdown_grace_seconds + worker.config.cancel_cleanup_seconds
+            )
+        shutdown_budget = max(0.0, shutdown_budget)
+        graceful_timeout = max(0.0, shutdown_budget - worker.config.cancel_cleanup_seconds)
+        deadline = asyncio.get_running_loop().time() + shutdown_budget
+        try:
+            async with asyncio.timeout(graceful_timeout):
+                await asyncio.shield(worker_task)
+        except asyncio.TimeoutError:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            await worker.force_recover_inflight(recovery_budget_seconds=remaining)
+            worker_task.cancel()
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            with suppress(asyncio.CancelledError, Exception):
+                async with asyncio.timeout(remaining):
+                    await asyncio.shield(worker_task)
+        finally:
+            self._workflow_worker_task = None
+
+    @staticmethod
+    def _worker_shutdown_fraction() -> float:
+        fraction = float(getattr(settings, "shutdown_worker_budget_fraction", 0.5))
+        if not 0 < fraction < 1:
+            raise ValueError("shutdown_worker_budget_fraction must be between zero and one")
+        return fraction
+
+    @classmethod
+    def _worker_shutdown_budget(cls, timeout_s: float) -> float:
+        return timeout_s * cls._worker_shutdown_fraction()
+
+    async def control_workflow_task(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        action: str,
+        reason_digest: str,
+    ) -> dict[str, str] | None:
+        """Apply an audited workflow operator action through the app boundary."""
+        if self.workflow_repository is None:
+            raise RuntimeError(_APP_NOT_STARTED)
+        return await self.workflow_repository.control_task(
+            run_id=run_id,
+            stage=stage,
+            action=action,
+            reason_digest=reason_digest,
+            now=utcnow(),
+        )
+
     async def startup(self):
         """执行应用启动流程（六阶段）
 
@@ -256,12 +390,13 @@ class PikoApp:
         5. 启动 ConfigWatcher 和 Scheduler
         6. 检查配置完整性 (Integrity Check)
         """
-        setup_logging()
-        logger.info("piko_app_startup", app=self.name, version=settings.version)
+        setup_logging(app_name=self.name)
+        logger.info("application_startup", app=self.name, version=settings.version)
 
         try:
             init_db()
             await verify_schema()
+            self.workflow_repository = MySQLWorkflowRepository(get_session_maker())
             recovered_locks = await self.runner.recover_expired_locks()
             if recovered_locks:
                 logger.warning("expired_job_locks_recovered", count=recovered_locks)
@@ -285,12 +420,19 @@ class PikoApp:
 
             # 启动时检查：代码里的 Job 是否在 DB 里配置了
             await self._check_scheduler_integrity()
+            await self.start_workflow_worker()
 
             self._started = True
-            logger.info("piko_app_started")
+            logger.info("application_started")
         except Exception as e:
-            logger.critical("piko_startup_unexpected_error", error=str(e))
+            logger.critical("application_startup_failed", error=str(e))
             raise e
+
+    async def create_workflow_run(self, definition: WorkflowDefinition) -> WorkflowRunRecord:
+        """Create or load a durable workflow run without changing legacy JobRun semantics."""
+        if self.workflow_repository is None:
+            raise RuntimeError(_APP_NOT_STARTED)
+        return await self.workflow_repository.create_run(definition)
 
     async def _check_scheduler_integrity(self):
         """检查任务配置完整性（防呆）
@@ -361,26 +503,45 @@ class PikoApp:
         self._shutdown_event.set()
         self._started = False
         timeout_s = float(getattr(settings, "shutdown_timeout_s", 30))
-        logger.info("piko_app_shutdown_begin", timeout_s=timeout_s)
+        logger.info("application_shutdown_begin", timeout_s=timeout_s)
         try:
-            await asyncio.wait_for(self._shutdown_components(), timeout=timeout_s)
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            async with asyncio.timeout(timeout_s):
+                await self._shutdown_components(deadline)
         except asyncio.TimeoutError:
-            logger.critical("piko_shutdown_timeout", timeout_s=timeout_s)
+            logger.critical("application_shutdown_timeout", timeout_s=timeout_s)
         else:
-            logger.info("piko_app_shutdown_complete")
+            logger.info("application_shutdown_complete")
 
-    async def _shutdown_components(self) -> None:
+    async def _shutdown_components(self, deadline: float | None = None) -> None:
         """按逆序关闭组件，供总停机预算统一约束。"""
-        await self.watcher.stop()
-        await asyncio.to_thread(self.scheduler.shutdown)
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + float(
+                getattr(settings, "shutdown_timeout_s", 30)
+            )
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        worker_budget = min(self._worker_shutdown_budget(remaining), remaining)
+        await self._shutdown_step(
+            lambda: self.stop_workflow_worker(shutdown_budget_seconds=worker_budget), deadline
+        )
+        await self._shutdown_step(self.watcher.stop, deadline)
+        await self._shutdown_step(lambda: asyncio.to_thread(self.scheduler.shutdown), deadline)
 
         if settings.leader_enabled:
-            await get_leader_watchdog().stop()
-            await get_leader_mutex().release()
+            await self._shutdown_step(get_leader_watchdog().stop, deadline)
+            await self._shutdown_step(get_leader_mutex().release, deadline)
 
-        await self.writer.stop()
-        await asyncio.to_thread(self.cpu_manager.shutdown)
-        await reset_db()
+        await self._shutdown_step(self.writer.stop, deadline)
+        await self._shutdown_step(lambda: asyncio.to_thread(self.cpu_manager.shutdown), deadline)
+        await self._shutdown_step(reset_db, deadline)
+
+    @staticmethod
+    async def _shutdown_step(operation: Callable[[], Awaitable[object]], deadline: float) -> None:
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        async with asyncio.timeout(remaining):
+            await operation()
 
     @asynccontextmanager
     async def _lifespan_context(self, _app: FastAPI):
@@ -403,7 +564,7 @@ class PikoApp:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
 
-        logger.info("piko_running_wait_for_signal")
+        logger.info("application_waiting_for_signal")
         await self._shutdown_event.wait()
         await self.shutdown()
 
