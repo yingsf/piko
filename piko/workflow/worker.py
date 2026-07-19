@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-import random
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -29,6 +29,8 @@ from piko.workflow.types import (
     WorkflowEventType,
     WorkflowTaskRecord,
 )
+
+_JITTER_SOURCE = secrets.SystemRandom()
 
 
 class WorkflowHandler(Protocol):
@@ -388,7 +390,7 @@ class WorkflowWorker:
 
     async def _retry(self, task: WorkflowTaskRecord, error_code: str, message: str) -> None:
         delay = self.config.retry_backoff_base_seconds * (2 ** max(0, task.attempt - 1))
-        delay += random.uniform(0, self.config.retry_jitter_seconds)
+        delay += _JITTER_SOURCE.uniform(0, self.config.retry_jitter_seconds)
         try:
             changed = await self.backend.retry_task(
                 task_id=task.task_id,

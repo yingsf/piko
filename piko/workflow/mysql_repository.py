@@ -45,6 +45,8 @@ from piko.workflow.types import (
     aggregate_business_result_status,
 )
 
+_EMPTY_LOCK_TOKEN: str | None = None
+
 
 def _technical_run_status(tasks: Sequence[WorkflowTask]) -> str:
     statuses = {task.status for task in tasks}
@@ -467,7 +469,7 @@ class MySQLWorkflowRepository(WorkflowControlBackend):
                     "status": target,
                     "available_at": None if terminal else now,
                     "owner": None,
-                    "lock_token": None,
+                    "lock_token": _EMPTY_LOCK_TOKEN,
                     "lease_until": None,
                     "heartbeat_at": None,
                     "finished_at": now if terminal else None,
@@ -772,7 +774,7 @@ class MySQLWorkflowRepository(WorkflowControlBackend):
             values={
                 "available_at": None,
                 "owner": None,
-                "lock_token": None,
+                "lock_token": _EMPTY_LOCK_TOKEN,
                 "lease_until": None,
                 "heartbeat_at": None,
                 "finished_at": now,
@@ -832,7 +834,7 @@ class MySQLWorkflowRepository(WorkflowControlBackend):
             values={
                 "available_at": None,
                 "owner": None,
-                "lock_token": None,
+                "lock_token": _EMPTY_LOCK_TOKEN,
                 "lease_until": None,
                 "heartbeat_at": None,
                 "finished_at": now,
