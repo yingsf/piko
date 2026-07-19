@@ -33,7 +33,7 @@
   - [示例 12：定时任务三种触发器（cron/interval/date）](#示例-12定时任务三种触发器cronintervaldate)
   - [示例 13：动态配置热更新（灰度生效 effective_from）](#示例-13动态配置热更新灰度生效-effective_from)
 - [示例 14：多实例部署（Leader Election）](#示例-14多实例部署leader-election)
-- [数据库迁移](#数据库迁移)
+- [数据库 schema](#数据库-schema)
 - [配置](#配置)
 - [运维端点与可观测性](#运维端点与可观测性)
 - [项目结构建议](#项目结构建议)
@@ -209,11 +209,11 @@ export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@127.0.0.1:3306/piko?charset=ut
 ### 3) 初始化数据库 schema
 
 ```bash
-piko db upgrade    # 创建全部表并写入 schema 版本
-piko db current    # 确认输出 0006_workflow_control_plane
+piko db init       # 创建或补齐全部 Piko 表
+piko db check      # 检查目标结构是否已经同步
 ```
 
-PikoApp 启动时会校验 schema 版本，未初始化或版本不匹配会直接启动失败。详见 [数据库迁移](#数据库迁移)。
+PikoApp 启动时会在 MySQL advisory lock 保护下自动创建或补齐 schema。详见 [数据库 schema](#数据库-schema)。
 
 ### 4) 写一个 Job，然后跑起来
 
@@ -306,7 +306,7 @@ ON DUPLICATE KEY UPDATE enabled=1, schedule_expr='{"seconds":5}', version=versio
 
 场景：你要扫一堆 URL，**并发抓取**，但要避免瞬间打爆下游（有界并发）。
 
-```python
+```text
 import asyncio
 import httpx
 from piko import PikoApp
@@ -568,7 +568,7 @@ Resource 的本质：**一个异步上下文管理器工厂**。 Piko 在每次 
 
 ### 8.1 定义一个 Resource（例如 HTTP Client）
 
-```python
+```text
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 import httpx
@@ -583,7 +583,7 @@ async def http_client(ctx: dict[str, object]) -> AsyncGenerator[httpx.AsyncClien
 
 ### 8.2 在 job 里声明并注入
 
-```python
+```text
 import asyncio
 from piko import PikoApp
 
@@ -616,7 +616,7 @@ async def fetch_with_resource(ctx, scheduled_time, client):
 
 ### 9.1 注入 Redis（示意）
 
-```python
+```text
 from contextlib import asynccontextmanager
 from piko.core.resource import resource
 
@@ -666,7 +666,7 @@ class PrintSink(ResultSink):
 
 ### 10.2 注册 Sink，并在 job 中 enqueue
 
-```python
+```text
 from piko import PikoApp
 from piko.persistence.intent import WriteIntent
 
@@ -725,7 +725,7 @@ class MyTypedSink(TypedSink):
 
 在 job 里 enqueue：
 
-```python
+```text
 from piko import PikoApp
 from piko.persistence.intent import WriteIntent
 
@@ -845,13 +845,11 @@ leader_renew_interval_s = 10
 
 ---
 
-## 数据库迁移
+## 数据库 schema
 
-Piko 启动时**只校验 schema 版本，不会自动执行 DDL**——每个应用副本启动时跑 DDL 在多副本部署下是危险的。首次部署或升级时，请在发布流程中单独执行迁移（典型做法是用一个 init-job / 发布前脚本）。
+Piko 不创建 `alembic_version`，也不要求业务项目维护 Piko 的版本表。应用启动时会在 MySQL advisory lock 保护下，以当前 ORM metadata 为目标结构执行幂等收敛；多副本同时启动时只有持锁副本执行 DDL，其余副本等待后复查结构。
 
-### 安装即可用的 CLI
-
-从 v0.1.10 起，迁移脚本与 Alembic 配置随 `piko` 包一起发布，安装后直接通过 `piko db` 命令管理数据库 schema，无需从源码仓库复制任何文件：
+### 初始化与升级
 
 ```bash
 pip install piko-cucc
@@ -859,45 +857,39 @@ pip install piko-cucc
 # 数据库连接通过 PIKO_MYSQL_DSN 配置（与应用启动使用同一配置源）
 export PIKO_MYSQL_DSN="mysql+aiomysql://user:pass@host:3306/piko?charset=utf8mb4"
 
-piko db upgrade            # 升级到 head（首次部署会创建全部表）
-piko db current            # 查看当前 schema 版本
-piko db downgrade -1       # 回退一步（降级前务必备份数据库）
-piko db history            # 查看完整迁移版本链
+piko db init               # 初始化空库或补齐已有库
+piko db upgrade            # init 的兼容别名
+piko db check              # 只检查，不执行 DDL
+piko db repair             # 重试之前失败的幂等收敛步骤
 ```
 
-每个子命令都支持 `--lock-timeout-s`（默认读 `PIKO_MIGRATION_LOCK_TIMEOUT_S=30`）。
+`init`、`upgrade` 和 `repair` 支持 `--lock-timeout-s`，默认读取 `PIKO_SCHEMA_LOCK_TIMEOUT_S=30`。
 
-### 多副本安全：MySQL advisory lock
+### 多副本安全与升级规则
 
-`piko db upgrade/downgrade` 在执行 Alembic 期间持有 MySQL 数据库级 advisory lock（锁名 `piko-schema-migration`），保证同一数据库**同时只有一个副本执行 DDL**。在 Kubernetes 等多副本环境，多个 init-job 同时启动迁移时，只有一个会真正执行，其余会等待锁（最多 `--lock-timeout-s` 秒，超时则失败退出）。
+schema 收敛持有名为 `piko-schema-bootstrap` 的 MySQL advisory lock，保证同一数据库**同时只有一个副本执行 DDL**。在 Kubernetes 等多副本环境，多个副本同时启动时，其余副本会等待锁（最多 `--lock-timeout-s` 秒，超时则启动失败）。
 
-### Schema 版本与升级路径
+自动处理的变更包括：
 
-当前 schema head 为 `0006_workflow_control_plane`。PikoApp 启动时会校验数据库的 `alembic_version` 必须等于该 head，不匹配则启动失败（避免代码与 schema 不一致导致运行时错误）。
+- 空库创建 Piko 当前需要的表、索引、唯一约束和外键
+- 已有库补齐新增表、字段、索引、唯一约束和外键
+- 对已知历史字段执行幂等的数据回填
+- 升级旧库时清理重复 `job_run`（保留最新 `run_id`）后再建立 attempt 唯一约束
+- 回填已有成功 `date` 任务的 `completed_at` 并禁用，避免升级后重复执行
 
-- **首次部署**：空库执行 `piko db upgrade` 即可，会按迁移链建出全部表并把版本写到 `0006_workflow_control_plane`。
-- **从 v0.1.9 及更早版本升级**：旧库会依次经过 `schema_v1` 和 `0006_workflow_control_plane`，新增 workflow control-plane 表，不修改旧的 `scheduled_job`/`job_run` 语义。**务必先迁移再启动新版本应用。**
-- **查看当前版本**：`piko db current` 或直接 `SELECT version_num FROM alembic_version`。
+不会自动执行以下变更：删除表、删除字段、字段重命名、可能造成数据截断的类型变更、无法推导历史数据的必填字段。遇到这些情况，Piko 会给出明确错误，发布者应先备份并提供显式 SQL/数据迁移，再升级应用。
 
-### 离线 SQL（DBA 审核场景）
-
-发布前可生成不连接数据库的迁移 SQL，交给 DBA 审核后手动执行：
-
-```bash
-# 在仓库内（需要迁移文件）生成离线 SQL
-uv run alembic -c piko/migrations/alembic.ini upgrade head --sql > /tmp/piko-upgrade.sql
-```
+Piko 不删除数据库中不属于当前 metadata 的表，因此旧版本遗留表不会被误删；新安装也不会创建版本表。schema 结构没有独立的历史记录，`piko db check` 以当前代码目标结构为准。
 
 ### 业务项目自定义表的推荐做法
 
-Piko 管理调度表（`scheduled_job`/`job_config`/`job_run`/`job_lock`/`scheduler_leader`）和通用 workflow 表（`workflow_run`/`workflow_task`/`workflow_task_dependency`/`workflow_task_event`/`workflow_task_manifest`）。如果你的业务项目还需要额外的表，**不要修改 Piko 的迁移文件**（会导致升级时冲突），推荐两种方式：
+Piko 管理调度表（`scheduled_job`/`job_config`/`job_run`/`job_lock`/`scheduler_leader`）和通用 workflow 表（`workflow_run`/`workflow_task`/`workflow_task_dependency`/`workflow_task_event`/`workflow_task_manifest`）。如果你的业务项目还需要额外的表，不要修改 Piko 源码中的 metadata；Piko 只会收敛自己声明的表，不会接管其他表。
 
-1. **独立 Alembic env（推荐）**：业务项目使用自己的 Alembic 配置和迁移目录，与 Piko 的迁移链完全解耦。两套迁移可以共用同一个数据库，各自的 `alembic_version` 表互不干扰（业务项目用独立的 `version_table`）。
-2. **合并 metadata**：如果希望统一管理，业务项目的 `target_metadata` 可以同时包含 `piko.infra.db.Base.metadata` 和业务自身的 metadata，但 autogenerate 时应排除 Piko 的表（在 `env.py` 的 `include_object` 钩子里过滤），避免业务迁移反向修改 Piko 表。
+业务项目可以使用自己的迁移工具管理自有表；如果希望统一管理，应把 Piko metadata 作为只读输入，并排除 Piko 表的破坏性变更。
 
-### `create_all_tables()` 仅用于测试
+### `create_all_tables()`
 
-`piko.infra.db.create_all_tables()` 通过 `Base.metadata.create_all` 直接建表，**不写 `alembic_version` 记录**，仅用于隔离测试或本地临时库的快速初始化。**生产环境必须通过 `piko db upgrade` 管理 schema**，不要使用此函数。
+`piko.infra.db.create_all_tables()` 现在与应用启动使用同一个 schema 收敛流程，适合测试和本地初始化。生产应用通常无需显式调用，`PikoApp.startup()` 会自动执行。
 
 ---
 

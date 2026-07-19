@@ -1,6 +1,6 @@
 [project]
 name = "piko-cucc"
-version = "0.1.11"
+version = "0.1.12"
 description = "Data-Oriented Async Task Orchestrator"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,7 +19,6 @@ classifiers = [
 ]
 dependencies = [
     "aiofiles>=25.1.0,<26",
-    "alembic>=1.18.5,<2",
     "apscheduler>=3.11.3,<4",
     "aiomysql>=0.3.2,<0.4",
     "cloudpickle>=3.1.2,<4",
@@ -39,7 +38,7 @@ Homepage = "https://github.com/yingsf/piko"
 Repository = "https://github.com/yingsf/piko"
 Documentation = "https://github.com/yingsf/piko/tree/dev#readme"
 
-# 命令行入口：安装后提供 `piko db upgrade` 等数据库迁移命令
+# 命令行入口：安装后提供 `piko db init/check/repair` 等 schema 命令
 [project.scripts]
 piko = "piko.cli.main:main"
 
@@ -51,9 +50,6 @@ build-backend = "hatchling.build"
 # 源码包位置
 [tool.hatch.build.targets.wheel]
 packages = ["piko"]
-# alembic.ini 与 revision 模板不是 .py 文件，需显式纳入 wheel，
-# 否则安装后 `piko db upgrade` 无法定位迁移配置。
-force-include = { "piko/migrations/alembic.ini" = "piko/migrations/alembic.ini", "piko/migrations/script.py.mako" = "piko/migrations/script.py.mako" }
 
 [tool.hatch.build.targets.sdist]
 include = ["piko", "README.md", "LICENSE", "pyproject.toml"]

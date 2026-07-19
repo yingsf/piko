@@ -31,7 +31,7 @@ from piko.infra.db import (
     init_db,
     reset_db,
     ScheduledJob,
-    verify_schema,
+    ensure_schema,
     utcnow,
 )
 from piko.infra.leader import get_leader_mutex, get_leader_watchdog
@@ -197,7 +197,7 @@ class PikoApp:
         async def readyz():
             """就绪检查端点 (Readiness Probe)
 
-            检查启动完成、数据库、Writer、Watcher、Scheduler 和 Leader 状态。
+            检查启动完成、数据库、Writer、Watcher、Scheduler、Workflow Worker 和 Leader 状态。
             """
             leader = get_leader_mutex()
             checks = {
@@ -395,7 +395,7 @@ class PikoApp:
 
         try:
             init_db()
-            await verify_schema()
+            await ensure_schema()
             self.workflow_repository = MySQLWorkflowRepository(get_session_maker())
             recovered_locks = await self.runner.recover_expired_locks()
             if recovered_locks:

@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from piko.infra.db import normalize_mysql_dsn
+from piko.infra.schema import ensure_schema
 from piko.workflow.mysql_repository import MySQLWorkflowRepository
 from piko.workflow.repository import InMemoryWorkflowRepository
 from piko.workflow.repository import WorkflowControlBackend
@@ -56,11 +57,10 @@ async def dual_backend(
     engine = create_async_engine(normalize_mysql_dsn(dsn), pool_pre_ping=True)
     maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     try:
-        async with engine.connect() as connection:
-            await connection.execute(text("SELECT 1 FROM workflow_run LIMIT 1"))
+        await ensure_schema(engine)
     except Exception as error:
         await engine.dispose()
-        pytest.skip(f"workflow schema is not available; run migrations first: {error}")
+        pytest.skip(f"workflow schema is not available: {error}")
 
     try:
         async with maker() as session, session.begin():

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -28,8 +30,8 @@ from piko.config import settings
 from piko.infra.logging import get_logger
 
 logger = get_logger(__name__)
-CURRENT_SCHEMA_REVISION = "0006_workflow_control_plane"
 DATABASE_NOT_INITIALIZED_MESSAGE = "Database not initialized. Call init_db() first."
+MYSQL_CURRENT_TIMESTAMP_DEFAULT = "CURRENT_TIMESTAMP(6)"
 WORKFLOW_RUN_FOREIGN_KEY = "workflow_run.run_id"
 WORKFLOW_TASK_FOREIGN_KEY = "workflow_task.task_id"
 
@@ -160,40 +162,44 @@ def get_session_maker() -> async_sessionmaker[AsyncSession]:
 
 
 async def create_all_tables() -> None:
-    """创建所有已定义的数据库表
+    """将数据库收敛到当前 Piko 目标结构。
 
-    此函数只供隔离测试准备临时数据库使用。生产环境必须通过 Alembic
-    迁移入口管理 schema，应用启动不会自动执行 DDL。
+    保留此函数名是为了兼容已有测试和本地初始化代码；现在它与应用启动
+    使用同一个带 advisory lock 的 schema 收敛流程。
     """
     if _engine is None:
         raise RuntimeError("Database not initialized.")
 
-    async with _engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    from piko.infra.schema import ensure_schema as reconcile_schema
+
+    await reconcile_schema(_engine)
 
 
-async def verify_schema() -> None:
-    """验证数据库已应用当前迁移版本
+async def ensure_schema(lock_timeout_s: int = 30):
+    """在数据库级锁保护下创建或升级 Piko 所需表结构。"""
+    if _engine is None:
+        raise RuntimeError(DATABASE_NOT_INITIALIZED_MESSAGE)
+
+    from piko.infra.schema import ensure_schema as reconcile_schema
+
+    return await reconcile_schema(_engine, lock_timeout_s=lock_timeout_s)
+
+
+async def verify_schema():
+    """检查数据库是否满足当前 Piko 目标结构，不执行 DDL。
 
     Raises:
-        RuntimeError: 当迁移版本缺失、过旧或数据库尚未初始化时。
+        RuntimeError: 当 schema 缺失或数据库尚未初始化时。
     """
     if _engine is None:
         raise RuntimeError(DATABASE_NOT_INITIALIZED_MESSAGE)
 
-    async with _engine.connect() as connection:
-        try:
-            result = await connection.execute(text("SELECT version_num FROM alembic_version"))
-        except Exception as error:
-            raise RuntimeError(
-                "Database schema is not initialized; run 'piko db upgrade' first."
-            ) from error
-        revision = result.scalar_one_or_none()
-    if revision != CURRENT_SCHEMA_REVISION:
-        raise RuntimeError(
-            f"Database schema revision {revision!r} does not match "
-            f"application revision {CURRENT_SCHEMA_REVISION!r}."
-        )
+    from piko.infra.schema import check_schema
+
+    report = await check_schema(_engine)
+    if not report.is_synchronized:
+        raise RuntimeError("Piko schema is not synchronized: " + report.summary())
+    return report
 
 
 async def check_database_connection() -> bool:
@@ -227,26 +233,55 @@ class ScheduledJob(Base):
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     schedule_type: Mapped[str] = mapped_column(String(16), nullable=False)
     schedule_expr: Mapped[str] = mapped_column(String(512), nullable=False)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai", nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timezone: Mapped[str] = mapped_column(
+        String(64),
+        default="Asia/Shanghai",
+        server_default=text("'Asia/Shanghai'"),
+        nullable=False,
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
-    misfire_grace_s: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
-    coalesce: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    max_instances: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    jitter_s: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    misfire_grace_s: Mapped[int] = mapped_column(
+        Integer, default=300, server_default=text("300"), nullable=False
+    )
+    coalesce: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
+    max_instances: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
+    jitter_s: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
 
-    executor: Mapped[str] = mapped_column(String(16), default="cpu", nullable=False)
-    concurrency_group: Mapped[str] = mapped_column(String(64), default="default", nullable=False)
+    executor: Mapped[str] = mapped_column(
+        String(16), default="cpu", server_default=text("'cpu'"), nullable=False
+    )
+    concurrency_group: Mapped[str] = mapped_column(
+        String(64), default="default", server_default=text("'default'"), nullable=False
+    )
 
-    is_stateful: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_stateful: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     last_data_time: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
-    max_lookback_window: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_lookback_window: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
 
-    version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
+    version: Mapped[int] = mapped_column(
+        BIGINT, default=1, server_default=text("1"), nullable=False
+    )
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+        DATETIME(fsp=6),
+        default=utcnow,
+        onupdate=utcnow,
+        server_default=text(MYSQL_CURRENT_TIMESTAMP_DEFAULT),
+        nullable=False,
     )
 
     __table_args__ = (
@@ -261,13 +296,21 @@ class JobConfig(Base):
 
     __tablename__ = "job_config"
     job_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    schema_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     effective_from: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
-    version: Mapped[int] = mapped_column(BIGINT, default=1, nullable=False)
+    version: Mapped[int] = mapped_column(
+        BIGINT, default=1, server_default=text("1"), nullable=False
+    )
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+        DATETIME(fsp=6),
+        default=utcnow,
+        onupdate=utcnow,
+        server_default=text(MYSQL_CURRENT_TIMESTAMP_DEFAULT),
+        nullable=False,
     )
 
     __table_args__ = (
@@ -299,7 +342,9 @@ class JobRun(Base):
     compute_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     persist_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    attempt: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
 
     error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -309,7 +354,10 @@ class JobRun(Base):
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DATETIME(fsp=6), default=utcnow, nullable=False
+        DATETIME(fsp=6),
+        default=utcnow,
+        server_default=text(MYSQL_CURRENT_TIMESTAMP_DEFAULT),
+        nullable=False,
     )
 
     __table_args__ = (
@@ -330,7 +378,10 @@ class JobLock(Base):
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
     owner_token: Mapped[str] = mapped_column(String(64), nullable=False)
     acquired_at: Mapped[datetime.datetime] = mapped_column(
-        DATETIME(fsp=6), default=utcnow, nullable=False
+        DATETIME(fsp=6),
+        default=utcnow,
+        server_default=text(MYSQL_CURRENT_TIMESTAMP_DEFAULT),
+        nullable=False,
     )
     expires_at: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
@@ -344,10 +395,16 @@ class SchedulerLeader(Base):
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner: Mapped[str] = mapped_column(String(128), nullable=False)
     lease_until: Mapped[datetime.datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
-    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
 
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DATETIME(fsp=6), default=utcnow, onupdate=utcnow, nullable=False
+        DATETIME(fsp=6),
+        default=utcnow,
+        onupdate=utcnow,
+        server_default=text(MYSQL_CURRENT_TIMESTAMP_DEFAULT),
+        nullable=False,
     )
 
 
@@ -391,8 +448,12 @@ class WorkflowTask(Base):
     workflow_id: Mapped[str] = mapped_column(String(128), nullable=False)
     stage: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    attempt: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default=text("3"), nullable=False
+    )
     available_at: Mapped[datetime.datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
     owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lock_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
